@@ -81,7 +81,7 @@ const option::Descriptor usage[] = {
 	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Main parameters***"},
 	{OUTPUT, 0, "O", "output", Arg::NonEmpty,
 		"  --output, -O <filename> "
-			"\tOutput file (niqkiOutput.gz)"
+			"\tOutput file (onikaOutput.gz)"
 	},
 
 	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Main parameters***"},
@@ -210,10 +210,29 @@ int main(int argc, char * argv[]){
 		return EXIT_FAILURE;
 	}
 	if (options[OUTPUT]) {
-		out_file = options[OUTPUT] ? (options[OUTPUT].last()->arg) : "niqkiOutput.gz";
+		out_file = options[OUTPUT] ? (options[OUTPUT].last()->arg) : "onikaOutput.gz";
 		DEBUG_MSG("Output file name = " << out_file);
 	} else {
-		out_file="niqkiOutput.gz";
+		out_file="onikaOutput.gz";
+	}
+	
+	
+	/**********************************************/
+	/* Display the ASCII art logo of the program. */
+	/**********************************************/
+	if (options[LOGO]) {
+		string logo_name="../resources/onika.ascii";    
+		ifstream logo;
+		string line;
+		logo.open(logo_name);
+		if (logo.is_open()){
+			while ( getline (logo,line) ){
+				cout << line << '\n';
+			}
+			logo.close();
+		}  
+		else cout << "Unable to open file :'"<<logo_name<<"'"<<endl;
+		return EXIT_SUCCESS;
 	}
 	cout << "+-------------------------------------------------------------------+" << endl;
 	cout << "|                            Informations                           |" << endl;
@@ -270,25 +289,6 @@ int main(int argc, char * argv[]){
 	cout << "| Query lasted (s)                  |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
 	elapsed_seconds = end - start;
 	cout << "| Whole run lasted (s)              |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
-
-
-	/**********************************************/
-	/* Display the ASCII art logo of the program. */
-	/**********************************************/
-	if (options[LOGO]) {
-		string logo_name="../resources/niqki.ascii";    
-		ifstream logo;
-		string line;
-		logo.open(logo_name);
-		if (logo.is_open()){
-			while ( getline (logo,line) ){
-				cout << line << '\n';
-			}
-			logo.close();
-		}  
-		else cout << "Unable to open file :'"<<logo_name<<"'"<<endl;
-		return EXIT_SUCCESS;
-	}
 	cout << "+-----------------------------------+-------------------------------+" << endl;
 	cout << "| k-mer size                        |" << setw(30) << setfill(' ') << K << " |" << endl
 		<< "| S                                 |" << setw(30) << setfill(' ') << F << " |" << endl

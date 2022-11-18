@@ -10,7 +10,7 @@ const int bufferSize = 10000;
 
 
 
-Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iH=4, const string ifilename="niqkiOutput.gz", double min_fract=0) {
+Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iH=4, const string ifilename="onikaOutput.gz", double min_fract=0) {
   filename=ifilename;
   pretty_printing=true;
   lF=ilF;
@@ -37,69 +37,6 @@ Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iH=4, const 
   }
 }
 
-
-
-void Index::dump_index_disk(const string& filestr)const{
-  zstr::ofstream out(filestr,ios::binary);
-	// VARIOUS INTEGERS
-	out.write(reinterpret_cast<const char*>(&lF), sizeof(lF));
-  out.write(reinterpret_cast<const char*>(&K), sizeof(K));
-  out.write(reinterpret_cast<const char*>(&H), sizeof(H));
-  out.write(reinterpret_cast<const char*>(&W), sizeof(W));
-  out.write(reinterpret_cast<const char*>(&min_score), sizeof(min_score));
-  out.write(reinterpret_cast<const char*>(&genome_numbers), sizeof(genome_numbers));
-  for(uint i(0);i<fingerprint_range*F;++i){
-    uint32_t size(Buckets[i].size());
-    out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-    out.write(reinterpret_cast<const char*>(&(Buckets[i][0])), size*sizeof(gid));
-  }
-  for(uint i(0);i<filenames.size();++i){
-    out.write((filenames[i]+'\n').c_str(),filenames[i].size()+1);
-  }
-}
-
-
-
-Index::Index(const string& filestr,bool ipretty_printing, const string ifilename) {
-  pretty_printing=ipretty_printing;
-  filename=ifilename;
-  zstr::ifstream in(filestr,ios::binary);
-  in.read(reinterpret_cast< char*>(&lF), sizeof(lF));
-  in.read(reinterpret_cast< char*>(&K), sizeof(K));
-  in.read(reinterpret_cast< char*>(&H), sizeof(H));
-  in.read(reinterpret_cast< char*>(&W), sizeof(W));
-  in.read(reinterpret_cast< char*>(&min_score), sizeof(min_score));
-  in.read(reinterpret_cast< char*>(&genome_numbers), sizeof(genome_numbers));
-  F=1<<lF;
-  M=W-H;
-  fingerprint_range=1<<W;
-  mask_M=(1<<M)-1;
-  maximal_remainder=(1<<H)-1;
-  Buckets=new vector<gid>[fingerprint_range*F];
-  offsetUpdatekmer=1;
-  offsetUpdatekmer<<=2*K;
-  for(uint32_t i=0; i<mutex_number;++i) {
-    omp_init_lock(&lock[i]);
-  }
-  for(uint i(0);i<fingerprint_range*F;++i){
-    uint32_t size;
-    in.read(reinterpret_cast< char*>(&size), sizeof(size));
-    if(size!=0){
-      Buckets[i].resize(size,0);
-      in.read(reinterpret_cast< char*>(&(Buckets[i][0])), size*sizeof(gid));
-    }
-  }
-  string genome_name;
-  for(uint i(0);i<genome_numbers;++i){
-    getline(in,genome_name);
-    filenames.push_back(genome_name);
-  }
-  if(pretty_printing){
-      outfile=new zstr::ofstream(filename);
-  }else{
-      outfile=new zstr::ofstream(filename,ios::binary);
-  }
-}
 
 
 
@@ -207,7 +144,6 @@ uint64_t Index::asm_log2(const uint64_t x) const {
 
 
 
-//UTILS
 uint64_t Index::nuc2intrc(char c)const {
   switch(c) {
     case 'A': return 3;
@@ -251,7 +187,6 @@ kmer Index::rcb(kmer min)const {
 
 
 
-//UTILS
 kmer Index::str2numstrand(const string& str)const {
   uint64_t res(0);
   for(uint i(0);i<str.size();i++) {
@@ -272,6 +207,15 @@ kmer Index::str2numstrand(const string& str)const {
   return (res);
 }
 
+
+/**
+     * \note The get_fingerprint take hashed a uint64_t.
+     * \brief Get the fingerprint.
+     *
+     * \param idx hashed to set.
+     * \brief Returns the result if any.
+     *
+*/
 
 
 int32_t Index::get_fingerprint(uint64_t hashed)const {
@@ -567,68 +511,6 @@ void Index::output_query(const query_output& toprint,const string& queryname)con
 
 
 
-void Index::query_range(uint32_t begin,uint32_t end)const {
-	uint size_batch(end-begin);
-	uint16_t *counts=new uint16_t[size_batch*genome_numbers];
-	memset(counts, 0, size_batch*genome_numbers*sizeof(*counts));
-	
-	//FOREACH BUCKET
-	#pragma omp parallel
-	{
-		vector<gid> target;
-		#pragma omp for
-		for(uint64_t i=0;i<fingerprint_range*F;++i){
-			target.clear();
-			// LOOK FOR QUERY GENOMES
-			for(uint64_t j(0);j<Buckets[i].size();++j){
-				if(Buckets[i][j]<end and Buckets[i][j]>= begin){
-					target.push_back(Buckets[i][j]-begin);
-				}
-			}
-			if(not target.empty()){
-				//COUNT HITS
-				for(uint64_t j(0);j<Buckets[i].size();++j){
-					for(uint64_t k(0);k<target.size();++k){
-						#pragma omp atomic
-						counts[Buckets[i][j]*size_batch+target[k]]++;
-					}
-				}
-			}
-		}
-	}
-	query_output toprint;
-	for(uint i(0);i<size_batch;i++){
-		toprint.clear();
-		for(uint j(0);j<genome_numbers;j++){
-			if(counts[j*size_batch+i]>=min_score){
-				toprint.push_back({counts[j*size_batch+i],j});
-			}
-		}
-		output_matrix(toprint,filenames[i+begin]);
-	}
-	delete []counts;
-}
-
-
-
-void Index::query_matrix()const {
-	*outfile<<"##Names"<<"\t";
-	for(uint i(0);i<filenames.size();++i){
-		*outfile<<filenames[i]<<"\t";
-	}
-	*outfile<<"\n";
-	uint i;
-	for(i=0;i<genome_numbers;i+=bufferSize){
-		if(i+bufferSize>genome_numbers){
-			query_range(i,genome_numbers);
-		}else{
-			query_range(i,i+bufferSize);
-		}
-	}
-}
-
-
-
 
 query_output Index::query_sketch(const vector<int32_t>& sketch)const {
     query_output result;
@@ -695,75 +577,6 @@ query_output Index::query_sequence(const string& str)const {
 }
 
 
-
-/*******************************************************************************************/
-/******************************* Code Duplication for matrix *******************************/
-/*******************************************************************************************/
-void Index::query_file_whole_matrix(const string& filestr) {
-  char type=get_data_type(filestr);
-  zstr::ifstream in(filestr);
-  string ref;
-  vector<int32_t> sketch(F,-1);
-  while(not in.eof()){
-    Biogetline(&in,ref,type);
-    if(ref.size()>K){
-      compute_sketch(ref,sketch);
-    }
-  }
-
-  auto out(query_sketch(sketch));
-  DEBUG_MSG("Sending out in :'"<<filestr<<"'");
-  output_matrix(out,filestr);
-}
-
-
-
-void Index::query_file_of_file_whole_matrix(const string& filestr) {
-  *outfile<<"##Names"<<"\t";
-  for(uint i(0);i<filenames.size();++i){
-    *outfile<<filenames[i]<<"\t";
-  }
-  *outfile<<"\n";
-  zstr::ifstream in(filestr);
-#pragma omp parallel
-{
-  string ref;
-  while(not in.eof()){
-
-    #pragma omp critical (input)
-    {
-      getline(in,ref);
-    }
-    if(exists_test(ref)){
-      query_file_whole_matrix(ref);
-    }
-    ref.clear();
-  }
-}
-}
-
-
-
-void Index::output_matrix(const query_output& toprint,const string& queryname)const{
-
-    double *buffer=new double[genome_numbers];
-	memset(buffer, 0, genome_numbers*sizeof(*buffer));
-    for(uint i(0);i<toprint.size();++i){
-      buffer[toprint[i].second]=((double)toprint[i].first)/F;
-    }
-    #pragma omp critical (outputfile)
-   {
-    *outfile<<queryname<<"\t";
-    for(uint i(0);i<genome_numbers;++i){
-      *outfile<<buffer[i]<<"\t";
-    }
-    *outfile<<"\n";
-    delete []buffer;
-  }
-}
-/***********************************************************************************************/
-/******************************* End Code Duplication for matrix *******************************/
-/***********************************************************************************************/
 
 atomic<uint32_t> genomes_downloaded(0);
 atomic<uint64_t> bases_downloaded(0);
