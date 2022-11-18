@@ -1,4 +1,4 @@
-bin_PROGRAMS = niqki
+bin_PROGRAMS = onika
 
 common_SOURCES = \
   common.h \
@@ -6,12 +6,12 @@ common_SOURCES = \
   strict_fstream.hpp \
   zstr_make_unique_polyfill.h \
   genome.h genome.cpp \
-  niqki_index.h niqki_index.cpp
+  onika_index.h onika_index.cpp
 
-niqki_SOURCES = \
+onika_SOURCES = \
   $(common_SOURCES) \
   optionparser.h \
-  niqki.cpp
+  onika.cpp
 
 MOSTLYCLEANFILES=*~
 CLEANFILES=*~ $(noinst_SCRIPTS)

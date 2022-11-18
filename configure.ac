@@ -2,10 +2,10 @@
 # The first parameter is project name
 # second is version number
 # third is bug report address
-AC_INIT([niqki], [1.0])
+AC_INIT([onika],[1.0])
 
 # Safety checks in case user overwritten --srcdir
-AC_CONFIG_SRCDIR([src/niqki.cpp])
+AC_CONFIG_SRCDIR([src/onika.cpp])
 
 # Store the auxiliary build tools (e.g., install-sh, config.sub, config.guess)
 # in this dir (build-aux)
@@ -151,7 +151,15 @@ dnl ============================ End of Compressinon ===========================
 
 
 #dnl Checks for header files.
-AC_HEADER_STDC
+m4_warn([obsolete],
+[The preprocessor macro `STDC_HEADERS' is obsolete.
+  Except in unusual embedded environments, you can safely include all
+  ISO C90 headers unconditionally.])dnl
+# Autoupdate added the next two lines to ensure that your configure
+# script's behavior did not change.  They are probably safe to remove.
+AC_CHECK_INCLUDES_DEFAULT
+AC_PROG_EGREP
+
 AC_CHECK_HEADERS([\
     libintl.h stdint.h \
     sys/ioctl.h sys/time.h \
