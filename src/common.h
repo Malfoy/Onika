@@ -1,5 +1,5 @@
 /*
- * This file comes more or less from the RedOak source code.
+ * This file is inspired by RedOak source code.
  */
 
 #ifndef __COMMON_H__

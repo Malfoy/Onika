@@ -1,6 +1,6 @@
 #include "strict_fstream.hpp"
 #include "zstr.hpp"
-#include "niqki_index.h"
+#include "onika_index.h"
 #include "common.h"
 
 
