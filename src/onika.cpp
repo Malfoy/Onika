@@ -158,8 +158,6 @@ static void restoreDir() {
 
 int main(int argc, char * argv[]){
 	int F=0,K=0,W=0,H=0;
-	bool pretty_printing=true;
-	double min_fract;
 	string list_file = "";
 	string query_file = "";
 	string out_file = "";
@@ -195,7 +193,6 @@ int main(int argc, char * argv[]){
 	DEBUG_MSG("H = " << H);
 	W = options[WORD] ? atoi(options[WORD].last()->arg) : 12;
 	DEBUG_MSG("W = " << W);
-	min_fract = options[MIN] ? atof(options[MIN].last()->arg) : 0;
 	DEBUG_MSG("min_fract = " << min_fract);
 
 	/************************************/
@@ -238,7 +235,7 @@ int main(int argc, char * argv[]){
 	cout << "|                            Informations                           |" << endl;
 	cout << "+-----------------------------------+-------------------------------+" << endl;
 	Index* monindex;
-	monindex=new Index(F,K,W,H,out_file,min_fract);
+	monindex=new Index(F,K,W,H,out_file);
 	time_point<system_clock> start, endindex,end;
 	start = std::chrono::system_clock::now();
 
@@ -254,7 +251,7 @@ int main(int argc, char * argv[]){
 		}
 		changeDirFromFilename(list_file.c_str());
 		DEBUG_MSG("Opening file : '"<<list_file<<"'");
-		monindex->insert_file_of_file_whole(list_file.substr(list_file.find_last_of("/\\") + 1));
+		monindex->insert_file(list_file.substr(list_file.find_last_of("/\\") + 1));
 		DEBUG_MSG("File added");
 		restoreDir();
 
@@ -277,12 +274,11 @@ int main(int argc, char * argv[]){
 			cout << "Unable to open the file '" << query_file << "'" << endl;
 		}
 		DEBUG_MSG("Opening file...");
-		monindex->query_file_of_file_whole(query_file);
+		monindex->query_file(query_file);
 		DEBUG_MSG("Query done.");
 	}
 
 	monindex->outfile->close();
-
 
 	end = std::chrono::system_clock::now();
 	elapsed_seconds = end - endindex;
