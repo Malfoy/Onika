@@ -212,8 +212,8 @@ int main(int argc, char * argv[]){
 	} else {
 		out_file="onikaOutput.gz";
 	}
-	
-	
+
+
 	/**********************************************/
 	/* Display the ASCII art logo of the program. */
 	/**********************************************/
