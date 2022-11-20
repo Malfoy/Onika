@@ -99,12 +99,38 @@ class Index {
 		}		
 
 		void get_filename(const string& filestr);
-		void insert_file(const string& filestr,uint32_t identifier, Sketch& iSketch);
+		void insert_file(const string& filestr,uint32_t identifier);
 
 		uint64_t asm_log2(const uint64_t x) const;
 		void Biogetline(zstr::ifstream* in,string& result,char type)const;
 		void Biogetline(zstr::ifstream* in,string& result,char type,string& header)const ;
 		char get_data_type(const string& filename)const;
+
+		kmer rcb(kmer min)const;
+		kmer str2numstrand(const string& str)const;
+		uint64_t revhash64 ( uint64_t x ) const;
+		uint64_t nuc2int(char c) const;
+		uint64_t nuc2intrc(char c) const;
+		void update_kmer(kmer& min, char nuc)const;
+
+		void update_kmer_RC(kmer& min, char nuc)const;
+
+		uint64_t unrevhash64 ( uint64_t x ) const;
+		uint64_t hash_family(const uint64_t x, const uint factor)const;
+
+
+		void fasta_sketch(const string& filestr);
+		void insert_sketch(void);
+		void merge_sketch(vector<int32_t>& sketch1,const vector<int32_t>& sketch2)const;
+		void sketch_densification(vector<int32_t>& sketch, uint empty_cell) const;
+		void compute_sketch(const string& reference, vector<int32_t>& sketch) const;
+		//HERE we only select the minimal hashes without computing the HMH fingerprint
+		void compute_sketch_kmer(const string& reference, vector<uint64_t>& sketch) const;
+		void insert_sketch(const vector<int32_t>& sketch,uint32_t genome_id);
+
+		uint64_t get_perfect_fingerprint(uint64_t hashed) const;
+
+
 };
 
 #endif

@@ -98,7 +98,6 @@ void Index::get_filename(const string& filestr) {
 	{
 		string ref;
 
-		Sketch iSketch;
 		uint32_t id;
 		while(not in.eof()) {
 			bool go = false;
@@ -121,7 +120,7 @@ void Index::get_filename(const string& filestr) {
 			}
 			if(go) {
 				DEBUG_MSG("Adding file :'"<<ref<<"'");
-				insert_file(ref,id,iSketch);
+				insert_file(ref,id);
 				DEBUG_MSG("File: '"<<ref<<"' added");
 			}
 
@@ -132,7 +131,7 @@ void Index::get_filename(const string& filestr) {
 
 
 
-void Index::insert_file(const string& filestr,uint32_t identifier,Sketch& iSketch) {
+void Index::insert_file(const string& filestr,uint32_t identifier) {
 	char type=get_data_type(filestr);
 	zstr::ifstream in(filestr);
 	string ref;
@@ -141,11 +140,11 @@ void Index::insert_file(const string& filestr,uint32_t identifier,Sketch& iSketc
 	while(not in.eof()) {
 		Biogetline(&in,ref,type);
 		if(ref.size()>K) {
-			iSketch.compute_sketch(ref,sketch);
+			compute_sketch(ref,sketch);
 		}
 		ref.clear();
 	}   
-	iSketch.insert_sketch(sketch,identifier);
+	insert_sketch(sketch,identifier);
 }
 
 
@@ -224,3 +223,176 @@ char Index::get_data_type(const string& filename)const{
 	return 'A';
 }
 
+
+
+kmer Index::rcb(kmer min)const {
+	kmer res(0);
+	kmer offset(1);
+	offset<<=(2*K-2);
+	for(uint i(0); i<K;++i){
+		res+=(3-(min%4))*offset;
+		min>>=2;
+		offset>>=2;
+	}
+	return res;
+}
+
+
+
+uint64_t Index::nuc2int(char c)const {
+	switch(c){
+		case 'C': return 1;
+		case 'G': return 2;
+		case 'T': return 3;
+		default: return 0;
+	}
+	exit(0);
+	return 0;
+}
+uint64_t Index::nuc2intrc(char c)const {
+	switch(c) {
+		case 'A': return 3;
+		case 'C': return 2;
+		case 'G': return 1;
+		default: return 0;
+	}
+	//~ cout<<"Unknow nucleotide: "<<c<<"!"<<endl;
+	exit(0);
+	return 0;
+}
+
+kmer Index::str2numstrand(const string& str)const {
+	uint64_t res(0);
+	for(uint i(0);i<str.size();i++) {
+		res<<=2;
+		switch (str[i]){
+			case 'A':res+=0;break;
+			case 'C':res+=1;break;
+			case 'G':res+=2;break;
+			case 'T':res+=3;break;
+
+			case 'a':res+=0;break;
+			case 'c':res+=1;break;
+			case 'g':res+=2;break;
+			case 't':res+=3;break;
+			default: return 0 ;break;
+		}
+	}
+	return (res);
+}
+
+
+uint64_t Index::revhash64 ( uint64_t x ) const {
+	x = ( ( x >> 32 ) ^ x ) * 0xD6E8FEB86659FD93;
+	x = ( ( x >> 32 ) ^ x ) * 0xD6E8FEB86659FD93;
+	x = ( ( x >> 32 ) ^ x );
+	return x;
+}
+
+
+
+uint64_t Index::unrevhash64(uint64_t x) const{
+	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
+	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
+	x = ((x >> 32) ^ x);
+	return x;
+}
+
+
+
+
+
+void Index::update_kmer(kmer& min, char nuc)const {
+	min<<=2;
+	min+=nuc2int(nuc);
+	min%=offsetUpdatekmer;
+}
+
+
+
+void Index::update_kmer_RC(kmer& min, char nuc)const {
+	min>>=2;
+	min+=(nuc2intrc(nuc)<<(2*K-2));
+}
+
+
+uint64_t Index::hash_family(const uint64_t x, const uint factor)const{
+	return unrevhash64(x)+factor*revhash64(x);
+}
+
+void Index::sketch_densification(vector<int32_t>& sketch, uint empty_cell) const {
+	uint step(0);
+	uint size(sketch.size());
+	while(empty_cell!=0){
+		for(uint i(0);i<size;i++){
+			if(sketch[i]!=-1){
+				uint64_t hash=hash_family(sketch[i],step)%size;
+				if(sketch[hash]==-1){
+					sketch[hash]=sketch[i];
+					empty_cell--;
+					if(empty_cell==0){
+						return;
+					}
+				}
+			}
+		}
+		step++;
+	}
+}
+
+uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
+	uint64_t result(hashed);
+	result<<=1;
+	result>>=1;
+	uint64_t twopowern(1);
+	twopowern<<=63;
+	double frac=((double)(twopowern-result))/twopowern;
+	frac=pow(frac,expected_gemome_size/F);
+	frac=1-frac;
+	return fingerprint_range*frac;
+}
+
+
+void Index::compute_sketch(const string& reference, vector<int32_t>& sketch) const {
+	if(sketch.size()!=F) {
+		sketch.resize(F,-1);
+	}
+	uint empty_cell(F);
+	kmer S_kmer(str2numstrand(reference.substr(0,K-1)));//get the first kmer (k-1 bases)
+	kmer RC_kmer(rcb(S_kmer));//The reverse complement
+	for(uint i(0);i+K<reference.size();++i) {// all kmer in the genome
+		Index::update_kmer(S_kmer,reference[i+K-1]);
+		Index::update_kmer_RC(RC_kmer,reference[i+K-1]);
+		kmer canon(min(S_kmer,RC_kmer));//Kmer min, the one selected
+		uint64_t hashed=revhash64(canon);
+		uint64_t bucket_id(unrevhash64(canon)>>(64-lF));//Which Bucket 
+		int32_t fp=get_perfect_fingerprint(hashed);
+		//MINHASH
+		if(sketch[bucket_id]==-1){
+			empty_cell--;
+			sketch[bucket_id]=fp;
+		}else if(sketch[bucket_id] > fp) {
+			sketch[bucket_id]=fp;
+		}
+	}
+	sketch_densification(sketch,empty_cell);
+}
+
+
+
+void Index::insert_sketch(const vector<int32_t>& sketch,uint32_t genome_id) {
+	for(uint i(0);i<F;++i) {
+		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
+			omp_set_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
+			Buckets[sketch[i]+i*fingerprint_range].push_back(genome_id);
+			omp_unset_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
+		}
+	}
+}
+
+
+void Index::merge_sketch( vector<int32_t>& sketch1,const vector<int32_t>& sketch2) const {
+	for(uint i(0);i<sketch1.size();++i) {
+		sketch1[i]=min(sketch1[i],sketch2[i]);
+	}
+}
