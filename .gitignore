@@ -16,6 +16,7 @@ src/.libs/
 src/onika
 src/ChangeLog
 
+onikaOutput.gz
 *.swp
 *.la
 *.lo

@@ -230,7 +230,6 @@ int main(int argc, char * argv[]){
 			logo.close();
 		}  
 		else cout << "Unable to open file :'"<<logo_name<<"'"<<endl;
-		return EXIT_SUCCESS;
 	}
 	cout << "+-------------------------------------------------------------------+" << endl;
 	cout << "|                            Informations                           |" << endl;

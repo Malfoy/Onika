@@ -215,14 +215,3 @@ char Index::get_data_type(const string& filename)const{
 	return 'A';
 }
 
-void Sketch::fasta_sketch(const string& filename) {
-
-}
-
-void Sketch::insert_sketch(void) {
-
-}
-
-void Sketch::query_sketch(Info sketch) {
-}
-

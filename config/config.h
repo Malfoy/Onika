@@ -77,7 +77,7 @@
 #define HAVE__BOOL 1
 
 /* Remove assertion checking */
-#define NDEBUG /**/
+/* #undef NDEBUG */
 
 /* Name of package */
 #define PACKAGE "onika"
