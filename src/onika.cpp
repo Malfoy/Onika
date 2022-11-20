@@ -1,4 +1,5 @@
 #include "onika_index.h"
+#include "onika_sketch.h"
 #include "optionparser.h"
 #include "common.h"
 

@@ -26,10 +26,10 @@
 
 
 using namespace std;
-using kmer = uint64_t;
 
 struct Info {
-	uint32_t ID, position;
+	uint32_t ID;
+	uint32_t position;
 };
 
 
@@ -37,12 +37,12 @@ class Sketch {
 	public:
 		string filename;
 		vector<string> filenames;
-		vector<Sketch> info;   // Array containing ID and Position
+		vector<Info> info_array;   // Array containing ID and Position
 
 		/**
 		 * \brief Default Sketch constructor.
 		 */
-		Sketch();
+		Sketch(char* inString);
 
 		/**
 		 * \brief Sketch Destructor.
@@ -51,7 +51,10 @@ class Sketch {
 
 		void fasta_sketch(const string& filestr);
 		void insert_sketch(void);
-		void query_sketch(Info sketch);
+		void query_sketch(Info isketch);
+
+	private:
+		char* iString;
 
 };
 

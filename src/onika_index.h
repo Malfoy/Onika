@@ -28,10 +28,6 @@
 using namespace std;
 using kmer = uint64_t;
 
-struct Info {
-	uint32_t ID, position;
-};
-
 
 class Index {
 	public:
@@ -109,28 +105,6 @@ class Index {
 		void Biogetline(zstr::ifstream* in,string& result,char type)const;
 		void Biogetline(zstr::ifstream* in,string& result,char type,string& header)const ;
 		char get_data_type(const string& filename)const;
-};
-
-class Sketch {
-	public:
-		string filename;
-		vector<string> filenames;
-		vector<Sketch> info;   // Array containing ID and Position
-
-		/**
-		 * \brief Default Sketch constructor.
-		 */
-		Sketch();
-
-		/**
-		 * \brief Sketch Destructor.
-		 */
-		~Sketch();
-
-		void fasta_sketch(const string& filestr);
-		void insert_sketch(void);
-		void query_sketch(Info sketch);
-
 };
 
 #endif

@@ -1,6 +1,6 @@
 #include "strict_fstream.hpp"
 #include "zstr.hpp"
-#include "onika_index.h"
+#include "onika_sketch.h"
 #include "common.h"
 
 
@@ -9,11 +9,9 @@ using namespace std;
 const int bufferSize = 10000;
 
 
-
-Sketch::Sketch(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iH=4, const string ifilename="onikaOutput.gz") {
+Sketch::Sketch(char* inString) {
+	string = inString;
 }
-
-
 
 
 Sketch::~Sketch() {
@@ -29,6 +27,6 @@ void Sketch::insert_sketch(void) {
 
 }
 
-void Sketch::query_sketch(Info sketch) {
+void Sketch::query_sketch(Info iSketch) {
 }
 
