@@ -85,23 +85,6 @@ uint64_t Index::asm_log2(const uint64_t x) const {
 	return y;
 }
 
-uint64_t Index::revhash64 ( uint64_t x ) const {
-	x = ( ( x >> 32 ) ^ x ) * 0xD6E8FEB86659FD93;
-	x = ( ( x >> 32 ) ^ x ) * 0xD6E8FEB86659FD93;
-	x = ( ( x >> 32 ) ^ x );
-	return x;
-}
-
-
-
-uint64_t Index::unrevhash64(uint64_t x) const{
-	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
-	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
-	x = ((x >> 32) ^ x);
-	return x;
-}
-
-
 
 
 void Index::get_filename(const string& filestr) {
@@ -149,7 +132,7 @@ void Index::get_filename(const string& filestr) {
 
 
 
-void Index::insert_file(const string& filestr,uint32_t identifier,Sketch iSketch) {
+void Index::insert_file(const string& filestr,uint32_t identifier,Sketch& iSketch) {
 	char type=get_data_type(filestr);
 	zstr::ifstream in(filestr);
 	string ref;
@@ -176,24 +159,6 @@ void Index::insert_file(const string& filestr,uint32_t identifier,Sketch iSketch
  *
  */
 
-int32_t Index::get_fingerprint(uint64_t hashed)const {
-	int32_t result;
-	result = hashed&mask_M;//we keep the last bits for the minhash part
-	uint32_t ll=asm_log2(hashed);//we compute the log of the hash
-	uint32_t size_zero_trail(64-ll-1);
-	int remaining_nonzero=maximal_remainder-size_zero_trail;
-	remaining_nonzero=max(0,remaining_nonzero);
-	// if the log is too high can cannont store it on H bit here we sature
-	result+=remaining_nonzero<<M;// we concatenant the hyperloglog part with the minhash part
-	return result;
-}
-
-
-
-
-
-atomic<uint32_t> genomes_downloaded(0);
-atomic<uint64_t> bases_downloaded(0);
 
 void Index::Biogetline(zstr::ifstream* in,string& result,char type,string& header)const {
 	string discard;

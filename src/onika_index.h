@@ -99,13 +99,9 @@ class Index {
 		}		
 
 		void get_filename(const string& filestr);
-		void insert_file(const string& filestr,uint32_t identifier, Sketch iSketch);
-
-		int32_t get_fingerprint(uint64_t hashed)const;
+		void insert_file(const string& filestr,uint32_t identifier, Sketch& iSketch);
 
 		uint64_t asm_log2(const uint64_t x) const;
-		uint64_t revhash64 ( uint64_t x ) const;
-		uint64_t unrevhash64 ( uint64_t x ) const;
 		void Biogetline(zstr::ifstream* in,string& result,char type)const;
 		void Biogetline(zstr::ifstream* in,string& result,char type,string& header)const ;
 		char get_data_type(const string& filename)const;
