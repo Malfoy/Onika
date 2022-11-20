@@ -6,6 +6,7 @@ common_SOURCES = \
   strict_fstream.hpp \
   zstr_make_unique_polyfill.h \
   genome.h genome.cpp \
+  onika_sketch.h onika_sketch.cpp \
   onika_index.h onika_index.cpp
 
 onika_SOURCES = \

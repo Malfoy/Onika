@@ -99,7 +99,8 @@ CONFIG_CLEAN_FILES =
 CONFIG_CLEAN_VPATH_FILES =
 am__installdirs = "$(DESTDIR)$(bindir)"
 PROGRAMS = $(bin_PROGRAMS)
-am__objects_1 = genome.$(OBJEXT) onika_index.$(OBJEXT)
+am__objects_1 = genome.$(OBJEXT) onika_sketch.$(OBJEXT) \
+	onika_index.$(OBJEXT)
 am_onika_OBJECTS = $(am__objects_1) onika.$(OBJEXT)
 onika_OBJECTS = $(am_onika_OBJECTS)
 onika_LDADD = $(LDADD)
@@ -119,7 +120,7 @@ DEFAULT_INCLUDES = -I.@am__isrc@ -I$(top_builddir)/config
 depcomp = $(SHELL) $(top_srcdir)/config/depcomp
 am__maybe_remake_depfiles = depfiles
 am__depfiles_remade = ./$(DEPDIR)/genome.Po ./$(DEPDIR)/onika.Po \
-	./$(DEPDIR)/onika_index.Po
+	./$(DEPDIR)/onika_index.Po ./$(DEPDIR)/onika_sketch.Po
 am__mv = mv -f
 CXXCOMPILE = $(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(INCLUDES) \
 	$(AM_CPPFLAGS) $(CPPFLAGS) $(AM_CXXFLAGS) $(CXXFLAGS)
@@ -278,6 +279,7 @@ common_SOURCES = \
   strict_fstream.hpp \
   zstr_make_unique_polyfill.h \
   genome.h genome.cpp \
+  onika_sketch.h onika_sketch.cpp \
   onika_index.h onika_index.cpp
 
 onika_SOURCES = \
@@ -378,6 +380,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/genome.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/onika.Po@am__quote@ # am--include-marker
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/onika_index.Po@am__quote@ # am--include-marker
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/onika_sketch.Po@am__quote@ # am--include-marker
 
 $(am__depfiles_remade):
 	@$(MKDIR_P) $(@D)
@@ -532,6 +535,7 @@ distclean: distclean-am
 		-rm -f ./$(DEPDIR)/genome.Po
 	-rm -f ./$(DEPDIR)/onika.Po
 	-rm -f ./$(DEPDIR)/onika_index.Po
+	-rm -f ./$(DEPDIR)/onika_sketch.Po
 	-rm -f Makefile
 distclean-am: clean-am distclean-compile distclean-generic \
 	distclean-tags
@@ -580,6 +584,7 @@ maintainer-clean: maintainer-clean-am
 		-rm -f ./$(DEPDIR)/genome.Po
 	-rm -f ./$(DEPDIR)/onika.Po
 	-rm -f ./$(DEPDIR)/onika_index.Po
+	-rm -f ./$(DEPDIR)/onika_sketch.Po
 	-rm -f Makefile
 maintainer-clean-am: distclean-am maintainer-clean-generic
 

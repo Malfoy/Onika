@@ -251,7 +251,7 @@ int main(int argc, char * argv[]){
 		}
 		changeDirFromFilename(list_file.c_str());
 		DEBUG_MSG("Opening file : '"<<list_file<<"'");
-		monindex->insert_file(list_file.substr(list_file.find_last_of("/\\") + 1));
+		monindex->get_filename(list_file.substr(list_file.find_last_of("/\\") + 1));
 		DEBUG_MSG("File added");
 		restoreDir();
 
@@ -266,7 +266,7 @@ int main(int argc, char * argv[]){
 	/* Add the query file and do the request */
 	/*****************************************/
 
-
+/*
 	if (options[QUERY]) {
 		query_file = options[QUERY].last()->arg;       
 		ifstream ifs(query_file);
@@ -277,7 +277,7 @@ int main(int argc, char * argv[]){
 		monindex->query_file(query_file);
 		DEBUG_MSG("Query done.");
 	}
-
+*/
 	monindex->outfile->close();
 
 	end = std::chrono::system_clock::now();

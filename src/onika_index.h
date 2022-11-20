@@ -21,13 +21,15 @@
 #include <omp.h>
 #include "zstr.hpp"
 #include "genome.h"
+#include "onika_sketch.h"
 #include <math.h>
 
 
 
 using namespace std;
 using kmer = uint64_t;
-
+using gid = uint32_t;
+const uint32_t mutex_number=65536;
 
 class Index {
 	public:
@@ -49,6 +51,8 @@ class Index {
 		//VARIABLE
 		string filename;
 		uint32_t genome_numbers;//Number of genomes
+		vector<gid>* Buckets;
+		omp_lock_t lock[mutex_number];
 		vector<string> filenames;
 		zstr::ofstream* outfile;
 		std::vector<Genome> infos;   // Array containing all Genomes informations.
@@ -94,11 +98,11 @@ class Index {
 			return (stat (name.c_str(), &buffer) == 0);
 		}		
 
-		void insert_file(const string& filestr);
-		void query_file(const string& filestr);
+		void get_filename(const string& filestr);
+		void insert_file(const string& filestr,uint32_t identifier, Sketch iSketch);
 
 		int32_t get_fingerprint(uint64_t hashed)const;
-		void merge_sketch( vector<int32_t>& sketch1,const vector<int32_t>& sketch2)const;
+
 		uint64_t asm_log2(const uint64_t x) const;
 		uint64_t revhash64 ( uint64_t x ) const;
 		uint64_t unrevhash64 ( uint64_t x ) const;
