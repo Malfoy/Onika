@@ -1,10 +1,11 @@
 /*
  * This file is inspired by RedOak source code.
- */
+*/
 
 #ifndef __COMMON_H__
 #define __COMMON_H__
 
+#define DEBUG
 #ifdef HAVE_CONFIG_H
 #  include <config.h>
 #endif
@@ -22,7 +23,7 @@
 // - OMP_CRITICAL_DEBUG_MSG(msg)
 #ifdef DEBUG
 #  define DBG(instructions) instructions; (void)0
-#  define DEBUG_MSG(msg)					\
+#  define DEBUG_MSG(msg)			\
   cout << MSG_LOG_HEADER << msg << endl;	\
   (void)0
 

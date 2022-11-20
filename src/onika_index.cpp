@@ -4,7 +4,6 @@
 #include "common.h"
 
 
-
 using namespace std;
 const int bufferSize = 10000;
 

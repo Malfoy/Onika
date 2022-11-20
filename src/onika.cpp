@@ -13,6 +13,7 @@
 #include <iomanip> // std::setw
 #include <zlib.h>
 
+
 using namespace std;
 using namespace chrono;
 
@@ -194,7 +195,6 @@ int main(int argc, char * argv[]){
 	DEBUG_MSG("H = " << H);
 	W = options[WORD] ? atoi(options[WORD].last()->arg) : 12;
 	DEBUG_MSG("W = " << W);
-	DEBUG_MSG("min_fract = " << min_fract);
 
 	/************************************/
 	/* Complain about unknown arguments */
