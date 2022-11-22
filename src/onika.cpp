@@ -60,8 +60,8 @@ enum  optionIndex {
 	OUTPUT,
 	KMER,
 	FETCH,
+	EGS,
 	WORD,
-	HHL,
 	MIN,
 	LOGO,
 	HELP
@@ -100,9 +100,9 @@ const option::Descriptor usage[] = {
 		"  --word, -W <int> "
 			"\tFingerprint size (12). Modify with caution, larger fingerprints enable queries with less false positive but increase EXPONENTIALY the overhead as the index count S*2^W cells. \v"
 	},
-	{HHL,  0, "H" , "HHL"  ,Arg::Numeric,
-		"  --HHL, -H <int> "
-			"\tSize of the hyperloglog section (4).  Modify with caution and prefer to use -G.\v"
+	{EGS,  0, "E" , "EGS"  ,Arg::Numeric,
+		"  --EGS, -E <int> "
+			"\t Expected gemome size (5 000 000).  Modify with caution.\v"
 	},
 	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Index files***"},
 	{LOGO, 0, "",  "logo", Arg::None,
@@ -159,7 +159,7 @@ static void restoreDir() {
 
 
 int main(int argc, char * argv[]){
-	int F=0,K=0,W=0,H=0;
+	int F=0,K=0,W=0,E=0;
 	string list_file = "";
 	string query_file = "";
 	string out_file = "";
@@ -191,8 +191,8 @@ int main(int argc, char * argv[]){
 	DEBUG_MSG("K = " << K);
 	F = options[FETCH] ? atoi(options[FETCH].last()->arg) : 15;
 	DEBUG_MSG("F = " << F);
-	H = options[HHL] ? atoi(options[HHL].last()->arg) : 4;
-	DEBUG_MSG("H = " << H);
+	E = options[EGS] ? atoi(options[EGS].last()->arg) : 5000000;
+	DEBUG_MSG("E = " << E);
 	W = options[WORD] ? atoi(options[WORD].last()->arg) : 12;
 	DEBUG_MSG("W = " << W);
 
@@ -235,7 +235,7 @@ int main(int argc, char * argv[]){
 	cout << "|                            Informations                           |" << endl;
 	cout << "+-----------------------------------+-------------------------------+" << endl;
 	Index* monindex;
-	monindex=new Index(F,K,W,H,out_file);
+	monindex=new Index(F,K,W,E,out_file);
 	time_point<system_clock> start, endindex,end;
 	start = std::chrono::system_clock::now();
 
@@ -290,7 +290,7 @@ int main(int argc, char * argv[]){
 		<< "| S                                 |" << setw(30) << setfill(' ') << F << " |" << endl
 		<< "| Number of fingerprints            |" << setw(30) << setfill(' ') << monindex->F<< " |" << endl
 		<< "| W                                 |" << setw(30) << setfill(' ') << W << " |" << endl
-		<< "| H                                 |" << setw(30) << setfill(' ') << H << " |" << endl
+		<< "| E                                 |" << setw(30) << setfill(' ') << E << " |" << endl
 		<< "| Number of indexed genomes         |" << setw(30) << setfill(' ') << monindex->getNbGenomes() << " |" << endl;
 	cout << "+-----------------------------------+-------------------------------+" << endl;
 

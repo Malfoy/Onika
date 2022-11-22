@@ -39,12 +39,11 @@ class Index {
 		uint32_t W;//fingerprint size
 		uint32_t M;//Minhash size
 		uint32_t mask_M;//minhash mask
-		uint32_t H;//Hll size (M+H=W)
+		uint32_t E;//Expected genome size (5000000)
 		uint32_t maximal_remainder;//2^H-1
 		uint32_t lF;//log2(F)
 		int32_t fingerprint_range;//2^w
 		uint64_t mask_fingerprint;//2^(64-lf)-1
-		uint64_t expected_gemome_size;
 		uint64_t offsetUpdatekmer;
 		uint32_t min_score;
 
@@ -60,7 +59,7 @@ class Index {
 		/**
 		 * \brief Default constructor.
 		 */
-		Index(uint32_t F, uint32_t K, uint32_t W, uint32_t H, string filename);
+		Index(uint32_t F, uint32_t K, uint32_t W, uint32_t E, string filename);
 		Index(const string& filestr, const string ifilename);
 
 
@@ -123,9 +122,8 @@ class Index {
 		void insert_sketch(void);
 		void merge_sketch(vector<int32_t>& sketch1,const vector<int32_t>& sketch2)const;
 		void sketch_densification(vector<int32_t>& sketch, uint empty_cell) const;
-		void compute_sketch(const string& reference, vector<int32_t>& sketch) const;
-		//HERE we only select the minimal hashes without computing the HMH fingerprint
 		void compute_sketch_kmer(const string& reference, vector<uint64_t>& sketch) const;
+		void compute_sketch(const string& reference, vector<int32_t>& sketch) const;
 		void insert_sketch(const vector<int32_t>& sketch,uint32_t genome_id);
 
 		uint64_t get_perfect_fingerprint(uint64_t hashed) const;

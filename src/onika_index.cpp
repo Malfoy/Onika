@@ -10,17 +10,14 @@ const int bufferSize = 10000;
 
 
 
-Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iH=4, const string ifilename="onikaOutput.gz") {
+Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iE=5000000, const string ifilename="onikaOutput.gz") {
 	filename=ifilename;
 	lF=ilF;
 	K=iK;
 	W=iW;
-	H=iH;
+	E=iE;
 	F=1<<lF;
-	M=W-H;
 	fingerprint_range=1<<W;
-	mask_M=(1<<M)-1;
-	maximal_remainder=(1<<H)-1;
 	genome_numbers=0;
 	Buckets=new vector<gid>[fingerprint_range*F];
 	offsetUpdatekmer=1;
@@ -36,15 +33,11 @@ Index::Index(const string& filestr, const string ifilename) {
 	zstr::ifstream in(filestr,ios::binary);
 	in.read(reinterpret_cast< char*>(&lF), sizeof(lF));
 	in.read(reinterpret_cast< char*>(&K), sizeof(K));
-	in.read(reinterpret_cast< char*>(&H), sizeof(H));
 	in.read(reinterpret_cast< char*>(&W), sizeof(W));
 	in.read(reinterpret_cast< char*>(&min_score), sizeof(min_score));
 	in.read(reinterpret_cast< char*>(&genome_numbers), sizeof(genome_numbers));
 	F=1<<lF;
-	M=W-H;
 	fingerprint_range=1<<W;
-	mask_M=(1<<M)-1;
-	maximal_remainder=(1<<H)-1;
 	Buckets=new vector<gid>[fingerprint_range*F];
 	offsetUpdatekmer=1;
 	offsetUpdatekmer<<=2*K;
@@ -71,7 +64,7 @@ Index::Index(const string& filestr, const string ifilename) {
 
 
 Index::~Index() {
-	//delete[] Buckets;
+	delete[] Buckets;
 	outfile->close();
 }
 
@@ -347,8 +340,15 @@ uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
 	uint64_t twopowern(1);
 	twopowern<<=63;
 	double frac=((double)(twopowern-result))/twopowern;
-	frac=pow(frac,expected_gemome_size/F);
+	DEBUG_MSG("-----------------------------------------------------------");
+	DEBUG_MSG("Frac value : '"<<frac<<"'");
+	frac=pow(frac,E/F);
+	DEBUG_MSG("E/F = '"<<E<<"/"<<F<<" = "<<E/F<<"'");
+	DEBUG_MSG("New frac value : '"<<frac<<"'");
 	frac=1-frac;
+	DEBUG_MSG("Fingerprint range : '"<<fingerprint_range<<"'");
+	DEBUG_MSG("Fingerprint range * frac =  '"<<fingerprint_range*frac<<"'");
+	DEBUG_MSG("-----------------------------------------------------------");
 	return fingerprint_range*frac;
 }
 
