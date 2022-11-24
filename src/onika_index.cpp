@@ -13,11 +13,12 @@ const int bufferSize = 10000;
 Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iE=5000000, const string ifilename="onikaOutput.gz") {
 	filename=ifilename;
 	lF=ilF;
-	K=iK;
 	W=iW;
+	K=iK;
 	E=iE;
 	F=1<<lF;
 	fingerprint_range=1<<W;
+	mi = -1; //mi =-1
 	genome_numbers=0;
 	Buckets=new vector<gid>[fingerprint_range*F];
 	offsetUpdatekmer=1;
@@ -129,7 +130,7 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
 	zstr::ifstream in(filestr);
 	string ref;
 	vector<uint64_t> kmer_sketch;
-	vector<int32_t> sketch(F,-1);
+	vector<uint64_t> sketch(F,-1);
 	while(not in.eof()) {
 		Biogetline(&in,ref,type);
 		if(ref.size()>K) {
@@ -150,7 +151,6 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
  * \brief Returns the result if any.
  *
  */
-
 
 void Index::Biogetline(zstr::ifstream* in,string& result,char type,string& header)const {
 	string discard;
@@ -313,14 +313,14 @@ uint64_t Index::hash_family(const uint64_t x, const uint factor)const{
 	return unrevhash64(x)+factor*revhash64(x);
 }
 
-void Index::sketch_densification(vector<int32_t>& sketch, uint empty_cell) const {
+void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) const {
 	uint step(0);
 	uint size(sketch.size());
 	while(empty_cell!=0){
 		for(uint i(0);i<size;i++){
-			if(sketch[i]!=-1){
+			if(sketch[i]!=mi){
 				uint64_t hash=hash_family(sketch[i],step)%size;
-				if(sketch[hash]==-1){
+				if(sketch[hash]==mi){
 					sketch[hash]=sketch[i];
 					empty_cell--;
 					if(empty_cell==0){
@@ -333,15 +333,20 @@ void Index::sketch_densification(vector<int32_t>& sketch, uint empty_cell) const
 	}
 }
 
+
 uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
-	uint64_t result(hashed);
-	result<<=1;
-	result>>=1;
+	//result = B
+	uint64_t B(hashed);
+	DEBUG_MSG("B    = '"<<B<<"'");
+	B<<=1;
+	B>>=1;
+	DEBUG_MSG("B>>1 = '"<<B<<"'");
 	uint64_t twopowern(1);
 	twopowern<<=63;
-	double frac=((double)(twopowern-result))/twopowern;
+	long double frac=((long double)(twopowern-B))/twopowern;
 	DEBUG_MSG("-----------------------------------------------------------");
 	DEBUG_MSG("Frac value : '"<<frac<<"'");
+	// x = taille du sketch/taille du génome
 	frac=pow(frac,E/F);
 	DEBUG_MSG("E/F = '"<<E<<"/"<<F<<" = "<<E/F<<"'");
 	DEBUG_MSG("New frac value : '"<<frac<<"'");
@@ -352,8 +357,7 @@ uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
 	return fingerprint_range*frac;
 }
 
-
-void Index::compute_sketch(const string& reference, vector<int32_t>& sketch) const {
+void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) const {
 	if(sketch.size()!=F) {
 		sketch.resize(F,-1);
 	}
@@ -366,9 +370,9 @@ void Index::compute_sketch(const string& reference, vector<int32_t>& sketch) con
 		kmer canon(min(S_kmer,RC_kmer));//Kmer min, the one selected
 		uint64_t hashed=revhash64(canon);
 		uint64_t bucket_id(unrevhash64(canon)>>(64-lF));//Which Bucket 
-		int32_t fp=get_perfect_fingerprint(hashed);
+		int32_t fp=hashed;
 		//MINHASH
-		if(sketch[bucket_id]==-1){
+		if(sketch[bucket_id]==mi){
 			empty_cell--;
 			sketch[bucket_id]=fp;
 		}else if(sketch[bucket_id] > fp) {
@@ -376,11 +380,14 @@ void Index::compute_sketch(const string& reference, vector<int32_t>& sketch) con
 		}
 	}
 	sketch_densification(sketch,empty_cell);
+	for(uint64_t i=0; i <sketch.size();++i){
+		sketch[i]=get_perfect_fingerprint(sketch[i]);
+	}
 }
 
 
 
-void Index::insert_sketch(const vector<int32_t>& sketch,uint32_t genome_id) {
+void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 	for(uint i(0);i<F;++i) {
 		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
 			omp_set_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);

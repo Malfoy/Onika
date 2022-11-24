@@ -44,6 +44,7 @@ class Index {
 		uint32_t lF;//log2(F)
 		int32_t fingerprint_range;//2^w
 		uint64_t mask_fingerprint;//2^(64-lf)-1
+		uint64_t mi; // -1
 		uint64_t offsetUpdatekmer;
 		uint32_t min_score;
 
@@ -119,12 +120,11 @@ class Index {
 
 
 		void fasta_sketch(const string& filestr);
-		void insert_sketch(void);
 		void merge_sketch(vector<int32_t>& sketch1,const vector<int32_t>& sketch2)const;
-		void sketch_densification(vector<int32_t>& sketch, uint empty_cell) const;
+		void sketch_densification(vector<uint64_t>& sketch, uint empty_cell) const;
 		void compute_sketch_kmer(const string& reference, vector<uint64_t>& sketch) const;
-		void compute_sketch(const string& reference, vector<int32_t>& sketch) const;
-		void insert_sketch(const vector<int32_t>& sketch,uint32_t genome_id);
+		void compute_sketch(const string& reference, vector<uint64_t>& sketch) const;
+		void insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id);
 
 		uint64_t get_perfect_fingerprint(uint64_t hashed) const;
 

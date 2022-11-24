@@ -236,6 +236,7 @@ int main(int argc, char * argv[]){
 	cout << "+-----------------------------------+-------------------------------+" << endl;
 	Index* monindex;
 	monindex=new Index(F,K,W,E,out_file);
+	//TODO PRINT TAILLE bucket
 	time_point<system_clock> start, endindex,end;
 	start = std::chrono::system_clock::now();
 
@@ -278,6 +279,7 @@ int main(int argc, char * argv[]){
 		DEBUG_MSG("Query done.");
 	}
 */
+	DEBUG_MSG("Output the index to :'"<<out_file<<"'");
 	monindex->outfile->close();
 
 	end = std::chrono::system_clock::now();
