@@ -403,3 +403,21 @@ void Index::merge_sketch( vector<int32_t>& sketch1,const vector<int32_t>& sketch
 		sketch1[i]=min(sketch1[i],sketch2[i]);
 	}
 }
+
+
+void Index::dump_index_disk(const string& filestr)const{
+	zstr::ofstream out(filestr,ios::binary);
+	out.write(reinterpret_cast<const char*>(&lF), sizeof(lF));
+	out.write(reinterpret_cast<const char*>(&K), sizeof(K));
+	out.write(reinterpret_cast<const char*>(&E), sizeof(E));
+	out.write(reinterpret_cast<const char*>(&W), sizeof(W));
+	out.write(reinterpret_cast<const char*>(&genome_numbers), sizeof(genome_numbers));
+	for(uint i(0);i<fingerprint_range*F;++i){
+		uint32_t size(Buckets[i].size());
+		out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+		out.write(reinterpret_cast<const char*>(&(Buckets[i][0])), size*sizeof(gid));
+	}
+	for(uint i(0);i<filenames.size();++i){
+		out.write((filenames[i]+'\n').c_str(),filenames[i].size()+1);
+	}
+}

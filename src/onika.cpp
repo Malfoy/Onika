@@ -58,6 +58,7 @@ enum  optionIndex {
 	LIST,
 	QUERY,
 	OUTPUT,
+	DUMP,
 	KMER,
 	FETCH,
 	EGS,
@@ -98,13 +99,20 @@ const option::Descriptor usage[] = {
 	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Advanced parameters*** (You know what you are doing)"},
 	{WORD,  0, "W" , "word"  ,Arg::Numeric,
 		"  --word, -W <int> "
-			"\tFingerprint size (12). Modify with caution, larger fingerprints enable queries with less false positive but increase EXPONENTIALY the overhead as the index count S*2^W cells. \v"
+			"\tFingerprint size (12). Modify with caution, \
+			larger fingerprints enable queries with less false positive but increase EXPONENTIALY\
+		       	the overhead as the index count S*2^W cells. \v"
 	},
 	{EGS,  0, "E" , "EGS"  ,Arg::Numeric,
 		"  --EGS, -E <int> "
 			"\t Expected gemome size (5 000 000).  Modify with caution.\v"
 	},
 	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Index files***"},
+	{DUMP, 0, "D", "dump", Arg::NonEmpty,
+		"  --dump, -D <filename> "
+			"\tDump the current index to the given file."
+	},
+
 	{LOGO, 0, "",  "logo", Arg::None,
 		"  --logo "
 			"\tPrint ASCII art logo, then exit."
@@ -257,6 +265,10 @@ int main(int argc, char * argv[]){
 		restoreDir();
 
 	}
+	if(options[DUMP]) {
+		string indexfile = options[DUMP].last()->arg;
+		monindex->dump_index_disk(indexfile);
+	}
 
 	endindex = std::chrono::system_clock::now();
 	std::chrono::duration<double> elapsed_seconds = endindex - start;
@@ -267,18 +279,18 @@ int main(int argc, char * argv[]){
 	/* Add the query file and do the request */
 	/*****************************************/
 
-/*
-	if (options[QUERY]) {
-		query_file = options[QUERY].last()->arg;       
-		ifstream ifs(query_file);
-		if (!ifs) {
-			cout << "Unable to open the file '" << query_file << "'" << endl;
-		}
-		DEBUG_MSG("Opening file...");
-		monindex->query_file(query_file);
-		DEBUG_MSG("Query done.");
-	}
-*/
+	/*
+	   if (options[QUERY]) {
+	   query_file = options[QUERY].last()->arg;       
+	   ifstream ifs(query_file);
+	   if (!ifs) {
+	   cout << "Unable to open the file '" << query_file << "'" << endl;
+	   }
+	   DEBUG_MSG("Opening file...");
+	   monindex->query_file(query_file);
+	   DEBUG_MSG("Query done.");
+	   }
+	   */
 	DEBUG_MSG("Output the index to :'"<<out_file<<"'");
 	monindex->outfile->close();
 

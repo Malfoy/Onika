@@ -125,7 +125,7 @@ class Index {
 		void compute_sketch_kmer(const string& reference, vector<uint64_t>& sketch) const;
 		void compute_sketch(const string& reference, vector<uint64_t>& sketch) const;
 		void insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id);
-
+		void dump_index_disk(const string& filestr)const ;
 		uint64_t get_perfect_fingerprint(uint64_t hashed) const;
 
 
