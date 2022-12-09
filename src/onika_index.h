@@ -52,6 +52,7 @@ class Index {
 		string filename;
 		uint32_t genome_numbers;//Number of genomes
 		vector<gid>* Buckets;
+		vector<uint16_t>* Buckets_pos;
 		omp_lock_t lock[mutex_number];
 		vector<string> filenames;
 		zstr::ofstream* outfile;

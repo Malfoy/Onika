@@ -59,6 +59,7 @@ enum  optionIndex {
 	QUERY,
 	OUTPUT,
 	DUMP,
+	LOAD,
 	KMER,
 	FETCH,
 	EGS,
@@ -101,13 +102,17 @@ const option::Descriptor usage[] = {
 		"  --word, -W <int> "
 			"\tFingerprint size (12). Modify with caution, \
 			larger fingerprints enable queries with less false positive but increase EXPONENTIALY\
-		       	the overhead as the index count S*2^W cells. \v"
+			the overhead as the index count S*2^W cells. \v"
 	},
 	{EGS,  0, "E" , "EGS"  ,Arg::Numeric,
 		"  --EGS, -E <int> "
 			"\t Expected gemome size (5 000 000).  Modify with caution.\v"
 	},
 	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Index files***"},
+	{LOAD, 0, "L", "load", Arg::NonEmpty,
+		"  --load, -L <filename> "
+			"\tLoad an index to the given file."
+	},
 	{DUMP, 0, "D", "dump", Arg::NonEmpty,
 		"  --dump, -D <filename> "
 			"\tDump the current index to the given file."
@@ -270,6 +275,10 @@ int main(int argc, char * argv[]){
 		monindex->dump_index_disk(indexfile);
 	}
 
+	if(options[LOAD]){
+		string indexfile = options[LOAD].last()->arg;
+		monindex = new Index(indexfile,out_file);
+	}
 	endindex = std::chrono::system_clock::now();
 	std::chrono::duration<double> elapsed_seconds = endindex - start;
 	cout << "| Indexing lasted (s)               |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;

@@ -23,6 +23,7 @@ Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iE=5000000, 
 	genome_numbers=0;
     cout<<fingerprint_range*F<<endl;
 	Buckets=new vector<gid>[fingerprint_range*F];
+	Buckets_pos=new vector<uint16_t>[fingerprint_range*F];
 	offsetUpdatekmer=1;
 	offsetUpdatekmer<<=2*K;
 	for(uint32_t i=0; i<mutex_number;++i) {
@@ -44,6 +45,7 @@ Index::Index(const string& filestr, const string ifilename) {
 	F=1<<lF;
 	fingerprint_range=1<<W;
 	Buckets=new vector<gid>[fingerprint_range*F];
+	Buckets_pos=new vector<uint16_t>[fingerprint_range*F];
 	offsetUpdatekmer=1;
 	offsetUpdatekmer<<=2*K;
 	for(uint32_t i=0; i<mutex_number;++i) {
@@ -71,6 +73,7 @@ Index::Index(const string& filestr, const string ifilename) {
 
 Index::~Index() {
 	delete[] Buckets;
+	delete[] Buckets_pos;
 	outfile->close();
 }
 
@@ -412,7 +415,8 @@ void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 	for(uint i(0);i<F;++i) {
 		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
 			omp_set_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
-			Buckets[sketch[i]+i*fingerprint_range].push_back(genome_id);
+			Buckets[sketch[i]].push_back(genome_id);
+			Buckets_pos[sketch[i]].push_back(i);
 			omp_unset_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
 		}
 	}
@@ -436,11 +440,15 @@ void Index::dump_index_disk(const string& filestr)const{
 	out.write(reinterpret_cast<const char*>(&W), sizeof(W));
 	out.write(reinterpret_cast<const char*>(&genome_numbers), sizeof(genome_numbers));
 	for(uint i(0);i<fingerprint_range*F;++i){
-		uint32_t size(Buckets[i].size());
+		uint64_t size(Buckets[i].size());
 		out.write(reinterpret_cast<const char*>(&size), sizeof(size));
 		out.write(reinterpret_cast<const char*>(&(Buckets[i][0])), size*sizeof(gid));
+		out.write(reinterpret_cast<const char*>(&(Buckets_pos[i][0])), size*sizeof(uint16_t));
 	}
 	for(uint i(0);i<filenames.size();++i){
 		out.write((filenames[i]+'\n').c_str(),filenames[i].size()+1);
 	}
 }
+
+
+
