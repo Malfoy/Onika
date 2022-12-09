@@ -57,6 +57,7 @@ Index::Index(const string& filestr, const string ifilename) {
 		if(size!=0){
 			Buckets[i].resize(size,0);
 			in.read(reinterpret_cast< char*>(&(Buckets[i][0])), size*sizeof(gid));
+			in.read(reinterpret_cast< char*>(&(Buckets_pos[i][0])), size*sizeof(uint16_t));
 		}
 	}
 	string genome_name;
