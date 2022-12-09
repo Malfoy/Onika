@@ -248,7 +248,13 @@ int main(int argc, char * argv[]){
 	cout << "|                            Informations                           |" << endl;
 	cout << "+-----------------------------------+-------------------------------+" << endl;
 	Index* monindex;
-	monindex=new Index(F,K,W,E,out_file);
+	if(options[LOAD]){
+		string indexfile = options[LOAD].last()->arg;
+		monindex = new Index(indexfile,out_file);
+	}else{
+		monindex=new Index(F,K,W,E,out_file);
+
+	}
 	//TODO PRINT TAILLE bucket
 	time_point<system_clock> start, endindex,end;
 	start = std::chrono::system_clock::now();
@@ -275,10 +281,6 @@ int main(int argc, char * argv[]){
 		monindex->dump_index_disk(indexfile);
 	}
 
-	if(options[LOAD]){
-		string indexfile = options[LOAD].last()->arg;
-		monindex = new Index(indexfile,out_file);
-	}
 	endindex = std::chrono::system_clock::now();
 	std::chrono::duration<double> elapsed_seconds = endindex - start;
 	cout << "| Indexing lasted (s)               |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
