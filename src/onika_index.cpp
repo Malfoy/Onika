@@ -293,8 +293,8 @@ kmer Index::str2numstrand(const string& str)const {
 
 
 uint64_t Index::revhash64 ( uint64_t x ) const {
-    x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
-	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
+    x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
+	x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
 	x = ((x >> 32) ^ x);
 	return x;
 }
