@@ -5,6 +5,7 @@
 #include "common.h"
 
 
+
 using namespace std;
 const int bufferSize = 10000;
 
@@ -16,10 +17,11 @@ Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iE=5000000, 
 	W=iW;
 	K=iK;
 	E=iE;
-	F=1<<lF;
-	fingerprint_range=1<<W;
+	F=(uint64_t)1<<lF;
+	fingerprint_range=(uint64_t)1<<W;
 	mi = -1; //mi =-1
 	genome_numbers=0;
+    cout<<fingerprint_range*F<<endl;
 	Buckets=new vector<gid>[fingerprint_range*F];
 	offsetUpdatekmer=1;
 	offsetUpdatekmer<<=2*K;
@@ -28,6 +30,8 @@ Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iE=5000000, 
 	}
 	outfile=new zstr::ofstream(filename);
 }
+
+
 
 Index::Index(const string& filestr, const string ifilename) {
 	filename=ifilename;
@@ -64,10 +68,12 @@ Index::Index(const string& filestr, const string ifilename) {
 }
 
 
+
 Index::~Index() {
 	delete[] Buckets;
 	outfile->close();
 }
+
 
 
 uint64_t Index::asm_log2(const uint64_t x) const {
@@ -121,6 +127,10 @@ void Index::get_filename(const string& filestr) {
 			ref.clear();
 		}
 	}
+    for(uint i(0);i<fingerprint_range*F;++i){
+        cout<<Buckets[i].size()<<" ";
+    }
+    cout<<endl;
 }
 
 
@@ -206,6 +216,7 @@ void Index::Biogetline(zstr::ifstream* in,string& result,char type)const {
 }
 
 
+
 char Index::get_data_type(const string& filename)const{
 	if(filename.find(".fq")!=string::npos){
 		return 'Q';
@@ -242,6 +253,9 @@ uint64_t Index::nuc2int(char c)const {
 	exit(0);
 	return 0;
 }
+
+
+
 uint64_t Index::nuc2intrc(char c)const {
 	switch(c) {
 		case 'A': return 3;
@@ -253,6 +267,8 @@ uint64_t Index::nuc2intrc(char c)const {
 	exit(0);
 	return 0;
 }
+
+
 
 kmer Index::str2numstrand(const string& str)const {
 	uint64_t res(0);
@@ -275,10 +291,11 @@ kmer Index::str2numstrand(const string& str)const {
 }
 
 
+
 uint64_t Index::revhash64 ( uint64_t x ) const {
-	x = ( ( x >> 32 ) ^ x ) * 0xD6E8FEB86659FD93;
-	x = ( ( x >> 32 ) ^ x ) * 0xD6E8FEB86659FD93;
-	x = ( ( x >> 32 ) ^ x );
+    x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
+	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
+	x = ((x >> 32) ^ x);
 	return x;
 }
 
@@ -290,8 +307,6 @@ uint64_t Index::unrevhash64(uint64_t x) const{
 	x = ((x >> 32) ^ x);
 	return x;
 }
-
-
 
 
 
@@ -309,9 +324,12 @@ void Index::update_kmer_RC(kmer& min, char nuc)const {
 }
 
 
+
 uint64_t Index::hash_family(const uint64_t x, const uint factor)const{
 	return unrevhash64(x)+factor*revhash64(x);
 }
+
+
 
 void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) const {
 	uint step(0);
@@ -332,6 +350,7 @@ void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) cons
 		step++;
 	}
 }
+
 
 
 uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
@@ -357,6 +376,8 @@ uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
 	return fingerprint_range*frac;
 }
 
+
+
 void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) const {
 	if(sketch.size()!=F) {
 		sketch.resize(F,-1);
@@ -370,7 +391,7 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		kmer canon(min(S_kmer,RC_kmer));//Kmer min, the one selected
 		uint64_t hashed=revhash64(canon);
 		uint64_t bucket_id(unrevhash64(canon)>>(64-lF));//Which Bucket 
-		int32_t fp=hashed;
+		uint64_t fp=hashed;
 		//MINHASH
 		if(sketch[bucket_id]==mi){
 			empty_cell--;
@@ -398,11 +419,13 @@ void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 }
 
 
+
 void Index::merge_sketch( vector<int32_t>& sketch1,const vector<int32_t>& sketch2) const {
 	for(uint i(0);i<sketch1.size();++i) {
 		sketch1[i]=min(sketch1[i],sketch2[i]);
 	}
 }
+
 
 
 void Index::dump_index_disk(const string& filestr)const{

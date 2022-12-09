@@ -42,7 +42,7 @@ class Index {
 		uint32_t E;//Expected genome size (5000000)
 		uint32_t maximal_remainder;//2^H-1
 		uint32_t lF;//log2(F)
-		int32_t fingerprint_range;//2^w
+		uint64_t fingerprint_range;//2^w
 		uint64_t mask_fingerprint;//2^(64-lf)-1
 		uint64_t mi; // -1
 		uint64_t offsetUpdatekmer;
