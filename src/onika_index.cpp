@@ -131,9 +131,9 @@ void Index::get_filename(const string& filestr) {
 			ref.clear();
 		}
 	}
-    for(uint i(0);i<fingerprint_range*F;++i){
-        cout<<Buckets[i].size()<<" ";
-    }
+    //~ for(uint i(0);i<fingerprint_range*F;++i){
+        //~ cout<<Buckets[i].size()<<" ";
+    //~ }
     cout<<endl;
 }
 
@@ -151,8 +151,30 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
 			compute_sketch(ref,sketch);
 		}
 		ref.clear();
-	}   
+	}
 	insert_sketch(sketch,identifier);
+}
+
+
+
+vector<uint32_t> Index::query_file(const string& filestr) {
+	char type=get_data_type(filestr);
+	zstr::ifstream in(filestr);
+	string ref;
+	vector<uint64_t> kmer_sketch;
+	vector<uint64_t> sketch(F,-1);
+	while(not in.eof()) {
+		Biogetline(&in,ref,type);
+		if(ref.size()>K) {
+			compute_sketch(ref,sketch);
+		}
+		ref.clear();
+	}
+	auto result(query_sketch(sketch));
+	for(uint i(0);i<result.size();++i){
+		outfile<<result[i]<<" ";
+	}
+	outfile<<endl;
 }
 
 
@@ -386,6 +408,7 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 	if(sketch.size()!=F) {
 		sketch.resize(F,-1);
 	}
+	cout<<"sketch"<<endl;
 	uint empty_cell(F);
 	kmer S_kmer(str2numstrand(reference.substr(0,K-1)));//get the first kmer (k-1 bases)
 	kmer RC_kmer(rcb(S_kmer));//The reverse complement
@@ -394,7 +417,7 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		Index::update_kmer_RC(RC_kmer,reference[i+K-1]);
 		kmer canon(min(S_kmer,RC_kmer));//Kmer min, the one selected
 		uint64_t hashed=revhash64(canon);
-		uint64_t bucket_id(unrevhash64(canon)>>(64-lF));//Which Bucket 
+		uint64_t bucket_id(unrevhash64(canon)>>(64-lF));//Which Bucket
 		uint64_t fp=hashed;
 		//MINHASH
 		if(sketch[bucket_id]==mi){
@@ -405,9 +428,13 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		}
 	}
 	sketch_densification(sketch,empty_cell);
-	for(uint64_t i=0; i <sketch.size();++i){
-		sketch[i]=get_perfect_fingerprint(sketch[i]);
-	}
+	//~ for(uint64_t i=0; i <sketch.size();++i){
+		//~ cout<<"avant";
+		//~ cout<<sketch[i]<<" ";
+		//~ sketch[i]=get_perfect_fingerprint(sketch[i]);
+		//~ cout<<"Apres"<<" ";
+		//~ cout<<sketch[i]<<endl;
+	//~ }
 }
 
 
@@ -421,6 +448,20 @@ void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 			omp_unset_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
 		}
 	}
+}
+
+
+
+vector<uint32_t> Index::query_sketch(const vector<uint64_t>& sketch){
+	vector<uint32_t> result(genome_numbers,0);
+	for(uint i(0);i<F;++i) {
+		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
+			for(uint j(0);j<Buckets[sketch[i]];++j){
+				result[Buckets[sketch[i]][j]]++;
+			}
+		}
+	}
+	return result;
 }
 
 

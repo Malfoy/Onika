@@ -6,7 +6,7 @@
 #include <vector>
 #include <string>
 #include <fstream>
-#include <iostream> 
+#include <iostream>
 
 #include <fcntl.h> //open
 #include <libgen.h> // dirname
@@ -232,7 +232,7 @@ int main(int argc, char * argv[]){
 	/* Display the ASCII art logo of the program. */
 	/**********************************************/
 	if (options[LOGO]) {
-		string logo_name="../resources/onika.ascii";    
+		string logo_name="../resources/onika.ascii";
 		ifstream logo;
 		string line;
 		logo.open(logo_name);
@@ -241,7 +241,7 @@ int main(int argc, char * argv[]){
 				cout << line << '\n';
 			}
 			logo.close();
-		}  
+		}
 		else cout << "Unable to open file :'"<<logo_name<<"'"<<endl;
 	}
 	cout << "+-------------------------------------------------------------------+" << endl;
@@ -264,7 +264,7 @@ int main(int argc, char * argv[]){
 	/*****************************************/
 	if (options[LIST]) {
 		//option::Option* opt = options[LIST];
-		list_file = options[LIST].last()->arg;       
+		list_file = options[LIST].last()->arg;
 		ifstream ifs(list_file);
 		if (!ifs) {
 			cout << "Unable to open the file '" << list_file << "'" << endl;
@@ -290,18 +290,18 @@ int main(int argc, char * argv[]){
 	/* Add the query file and do the request */
 	/*****************************************/
 
-	/*
-	   if (options[QUERY]) {
-	   query_file = options[QUERY].last()->arg;       
-	   ifstream ifs(query_file);
-	   if (!ifs) {
-	   cout << "Unable to open the file '" << query_file << "'" << endl;
-	   }
-	   DEBUG_MSG("Opening file...");
-	   monindex->query_file(query_file);
-	   DEBUG_MSG("Query done.");
-	   }
-	   */
+
+	if (options[QUERY]) {
+	query_file = options[QUERY].last()->arg;
+	ifstream ifs(query_file);
+	if (!ifs) {
+	cout << "Unable to open the file '" << query_file << "'" << endl;
+	}
+	DEBUG_MSG("Opening file...");
+	monindex->query_file(query_file);
+	DEBUG_MSG("Query done.");
+	}
+
 	DEBUG_MSG("Output the index to :'"<<out_file<<"'");
 	monindex->outfile->close();
 

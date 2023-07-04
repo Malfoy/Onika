@@ -97,7 +97,7 @@ class Index {
 		inline bool exists_test (const std::string& name)const {
 			struct stat buffer;
 			return (stat (name.c_str(), &buffer) == 0);
-		}		
+		}
 
 		void get_filename(const string& filestr);
 		void insert_file(const string& filestr,uint32_t identifier);
@@ -118,6 +118,8 @@ class Index {
 
 		uint64_t unrevhash64 ( uint64_t x ) const;
 		uint64_t hash_family(const uint64_t x, const uint factor)const;
+		vector<uint32_t> query_file(const string& filestr);
+		vector<uint32_t> query_sketch(const vector<uint64_t>& sketch);
 
 
 		void fasta_sketch(const string& filestr);
