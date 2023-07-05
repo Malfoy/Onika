@@ -158,6 +158,7 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
 
 
 vector<uint32_t> Index::query_file(const string& filestr) {
+	cout<<"Query:"<<filestr<<endl;
 	char type=get_data_type(filestr);
 	zstr::ifstream in(filestr);
 	string ref;
@@ -172,9 +173,12 @@ vector<uint32_t> Index::query_file(const string& filestr) {
 	}
 	auto result(query_sketch(sketch));
 	for(uint i(0);i<result.size();++i){
-		outfile<<result[i]<<" ";
+		*outfile<<result[i]<<" ";
+		cout<<result[i]<<" ";
 	}
-	outfile<<endl;
+	*outfile<<endl;
+	cout<<endl;
+	return result;
 }
 
 
@@ -408,7 +412,7 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 	if(sketch.size()!=F) {
 		sketch.resize(F,-1);
 	}
-	cout<<"sketch"<<endl;
+	//~ cout<<"sketch"<<endl;
 	uint empty_cell(F);
 	kmer S_kmer(str2numstrand(reference.substr(0,K-1)));//get the first kmer (k-1 bases)
 	kmer RC_kmer(rcb(S_kmer));//The reverse complement
@@ -428,20 +432,20 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		}
 	}
 	sketch_densification(sketch,empty_cell);
-	//~ for(uint64_t i=0; i <sketch.size();++i){
+	for(uint64_t i=0; i <sketch.size();++i){
 		//~ cout<<"avant";
 		//~ cout<<sketch[i]<<" ";
-		//~ sketch[i]=get_perfect_fingerprint(sketch[i]);
+		sketch[i]=get_perfect_fingerprint(sketch[i]);
 		//~ cout<<"Apres"<<" ";
 		//~ cout<<sketch[i]<<endl;
-	//~ }
+	}
 }
 
 
 
 void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 	for(uint i(0);i<F;++i) {
-		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
+		if(sketch[i]<fingerprint_range and sketch[i]>=0){
 			omp_set_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
 			Buckets[sketch[i]].push_back(genome_id);
 			Buckets_pos[sketch[i]].push_back(i);
@@ -456,8 +460,10 @@ vector<uint32_t> Index::query_sketch(const vector<uint64_t>& sketch){
 	vector<uint32_t> result(genome_numbers,0);
 	for(uint i(0);i<F;++i) {
 		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
-			for(uint j(0);j<Buckets[sketch[i]];++j){
-				result[Buckets[sketch[i]][j]]++;
+			for(uint j(0);j<Buckets[sketch[i]].size();++j){
+				if(Buckets_pos[sketch[i]][j]==i){
+					result[Buckets[sketch[i]][j]]++;
+				}
 			}
 		}
 	}

@@ -1,0 +1,3 @@
+r1m.fa.gz
+r1m.fa.gz
+r1mbis.fa.gz
