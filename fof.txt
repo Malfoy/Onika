@@ -1,3 +1,4 @@
-r1m.fa.gz
-r1m.fa.gz
-r1mbis.fa.gz
+genome1.fasta
+genome1.fasta
+genome2.fasta
+genome3.fasta

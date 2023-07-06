@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iostream>
 #include <vector>
+#include <map>
 #include <atomic>
 #include <mutex>
 #include <stdint.h>
@@ -23,7 +24,7 @@
 #include "genome.h"
 #include "onika_sketch.h"
 #include <math.h>
-
+#include <iomanip>
 
 
 using namespace std;
@@ -57,7 +58,7 @@ class Index {
 		vector<string> filenames;
 		zstr::ofstream* outfile;
 		std::vector<Genome> infos;   // Array containing all Genomes informations.
-
+		std::map<std::string, std::vector<uint64_t>> file_sketches; // map to store sketches
 		/**
 		 * \brief Default constructor.
 		 */
@@ -119,7 +120,7 @@ class Index {
 		uint64_t unrevhash64 ( uint64_t x ) const;
 		uint64_t hash_family(const uint64_t x, const uint factor)const;
 		vector<uint32_t> query_file(const string& filestr);
-		vector<uint32_t> query_sketch(const vector<uint64_t>& sketch);
+		vector<uint32_t> query_sketch(const vector<uint64_t>& sketch) const;
 
 
 		void fasta_sketch(const string& filestr);
@@ -130,6 +131,8 @@ class Index {
 		void insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id);
 		void dump_index_disk(const string& filestr)const ;
 		uint64_t get_perfect_fingerprint(uint64_t hashed) const;
+
+		void print_matrix() const;
 
 
 };

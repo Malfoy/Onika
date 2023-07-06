@@ -21,7 +21,7 @@ Index::Index(uint32_t ilF=10, uint32_t iK=31,uint32_t iW=8,uint32_t iE=5000000, 
 	fingerprint_range=(uint64_t)1<<W;
 	mi = -1; //mi =-1
 	genome_numbers=0;
-    cout<<fingerprint_range*F<<endl;
+	//cout<<fingerprint_range*F<<endl;
 	Buckets=new vector<gid>[fingerprint_range*F];
 	Buckets_pos=new vector<uint16_t>[fingerprint_range*F];
 	offsetUpdatekmer=1;
@@ -90,51 +90,37 @@ uint64_t Index::asm_log2(const uint64_t x) const {
 }
 
 
-
 void Index::get_filename(const string& filestr) {
-	DEBUG_MSG("Opening file : '"<<filestr<<"'");
+	DEBUG_MSG("Opening file : '" << filestr << "'");
 	ifstream in(filestr);
 	if (!in) {
 		cout << "Unable to open the file '" << filestr << "'" << endl;
 		exit(0);
 	}
-#pragma omp parallel
-	{
-		string ref;
 
-		uint32_t id;
-		while(not in.eof()) {
-			bool go = false;
-#pragma omp critical (input)
-			{
-				getline(in,ref);
-			}
-			DEBUG_MSG("Getline from file :'"<<filestr<<"' = '"<<ref<<"'");
+	string ref;
+	uint32_t id;
+
+	while (getline(in, ref)) {
+		DEBUG_MSG("Getline from file :'" << filestr << "' = '" << ref << "'");
+
+		if (ref.size() > 2 && exists_test(ref)) {
 #pragma omp critical (genome_numbers)
 			{
-				if(ref.size()>2){
-					if(exists_test(ref)) {
-						id=genome_numbers;
-						DEBUG_MSG("Genome numbers: "<<genome_numbers);
-						genome_numbers++;
-						filenames.push_back(ref);
-						go=true;
-					}
-				}
+				id = genome_numbers;
+				DEBUG_MSG("Genome numbers: " << genome_numbers);
+				genome_numbers++;
+				filenames.push_back(ref);
 			}
-			if(go) {
-				DEBUG_MSG("Adding file :'"<<ref<<"'");
-				insert_file(ref,id);
-				DEBUG_MSG("File: '"<<ref<<"' added");
-			}
-
-			ref.clear();
+			DEBUG_MSG("Adding file :'" << ref << "'");
+			insert_file(ref, id);
+			DEBUG_MSG("File: '" << ref << "' added");
 		}
+
+		ref.clear();
 	}
-    //~ for(uint i(0);i<fingerprint_range*F;++i){
-        //~ cout<<Buckets[i].size()<<" ";
-    //~ }
-    cout<<endl;
+
+	cout << endl;
 }
 
 
@@ -152,6 +138,7 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
 		}
 		ref.clear();
 	}
+	file_sketches[filestr] = sketch;
 	insert_sketch(sketch,identifier);
 }
 
@@ -323,7 +310,7 @@ kmer Index::str2numstrand(const string& str)const {
 
 
 uint64_t Index::revhash64 ( uint64_t x ) const {
-    x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
+	x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
 	x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
 	x = ((x >> 32) ^ x);
 	return x;
@@ -386,23 +373,23 @@ void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) cons
 uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
 	//result = B
 	uint64_t B(hashed);
-	DEBUG_MSG("B    = '"<<B<<"'");
+	//DEBUG_MSG("B    = '"<<B<<"'");
 	B<<=1;
 	B>>=1;
-	DEBUG_MSG("B>>1 = '"<<B<<"'");
+	//DEBUG_MSG("B>>1 = '"<<B<<"'");
 	uint64_t twopowern(1);
 	twopowern<<=63;
 	long double frac=((long double)(twopowern-B))/twopowern;
-	DEBUG_MSG("-----------------------------------------------------------");
-	DEBUG_MSG("Frac value : '"<<frac<<"'");
+	//DEBUG_MSG("-----------------------------------------------------------");
+	//DEBUG_MSG("Frac value : '"<<frac<<"'");
 	// x = taille du sketch/taille du génome
 	frac=pow(frac,E/F);
-	DEBUG_MSG("E/F = '"<<E<<"/"<<F<<" = "<<E/F<<"'");
-	DEBUG_MSG("New frac value : '"<<frac<<"'");
+	//DEBUG_MSG("E/F = '"<<E<<"/"<<F<<" = "<<E/F<<"'");
+	//DEBUG_MSG("New frac value : '"<<frac<<"'");
 	frac=1-frac;
-	DEBUG_MSG("Fingerprint range : '"<<fingerprint_range<<"'");
-	DEBUG_MSG("Fingerprint range * frac =  '"<<fingerprint_range*frac<<"'");
-	DEBUG_MSG("-----------------------------------------------------------");
+	//DEBUG_MSG("Fingerprint range : '"<<fingerprint_range<<"'");
+	//DEBUG_MSG("Fingerprint range * frac =  '"<<fingerprint_range*frac<<"'");
+	//DEBUG_MSG("-----------------------------------------------------------");
 	return fingerprint_range*frac;
 }
 
@@ -412,6 +399,7 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 	if(sketch.size()!=F) {
 		sketch.resize(F,-1);
 	}
+	DEBUG_MSG("------------------SKETCH--------------------");
 	//~ cout<<"sketch"<<endl;
 	uint empty_cell(F);
 	kmer S_kmer(str2numstrand(reference.substr(0,K-1)));//get the first kmer (k-1 bases)
@@ -434,11 +422,14 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 	sketch_densification(sketch,empty_cell);
 	for(uint64_t i=0; i <sketch.size();++i){
 		//~ cout<<"avant";
+		//DEBUG_MSG("SKETCH avant : '"<<sketch[i]<<"'");
 		//~ cout<<sketch[i]<<" ";
 		sketch[i]=get_perfect_fingerprint(sketch[i]);
 		//~ cout<<"Apres"<<" ";
 		//~ cout<<sketch[i]<<endl;
+		//DEBUG_MSG("SKETCH apres : '"<<sketch[i]<<"'");
 	}
+	DEBUG_MSG("------------------SKETCH END--------------------");
 }
 
 
@@ -456,7 +447,7 @@ void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 
 
 
-vector<uint32_t> Index::query_sketch(const vector<uint64_t>& sketch){
+vector<uint32_t> Index::query_sketch(const vector<uint64_t>& sketch) const{
 	vector<uint32_t> result(genome_numbers,0);
 	for(uint i(0);i<F;++i) {
 		if(sketch[i]<fingerprint_range and sketch[i]>=0) {
@@ -498,5 +489,52 @@ void Index::dump_index_disk(const string& filestr)const{
 	}
 }
 
+void Index::print_matrix() const {
+    DEBUG_MSG("PRINT MATRIX: ");
+    int size = genome_numbers;
+    vector<vector<uint32_t>> matrix(size, vector<uint32_t>(size));
 
+    for(int i = 0; i < size; ++i){
+        DEBUG_MSG("i:'" << i << "' new");
+        auto it_i = file_sketches.find(filenames[i]);
+        if (it_i == file_sketches.end()) {
+            throw std::runtime_error("Key not found");
+        }
+        const vector<uint64_t>& sketch_i = it_i->second;
+        for(int j = i; j < size; ++j){
+            DEBUG_MSG("j:'" << j << "' new");
+            if(i == j){
+                matrix[i][j] = F;
+            } else {
+                auto it_j = file_sketches.find(filenames[j]);
+                if (it_j == file_sketches.end()) {
+                    throw std::runtime_error("Key not found");
+                }
+                const vector<uint64_t>& sketch_j = it_j->second;
+                vector<uint32_t> result = query_sketch(sketch_j);
+                matrix[i][j] = result[i];
+                matrix[j][i] = result[j];
+            }
+        }
+    }
+
+    cout << "##Names ";
+    for (int i = 0; i < size; ++i) {
+        cout << filenames[i] << "\t";
+    }
+    cout << endl;
+
+    for(int i = 0; i < size; ++i) {
+        cout << filenames[i] << "\t";
+        for(int j = 0; j < size; ++j) {
+            if(i == j)
+                cout << "-\t";
+            else if(i < j)
+                cout << "-\t";
+            else
+                cout << matrix[i][j] << "\t";
+        }
+        cout << endl;
+    }
+}
 

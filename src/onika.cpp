@@ -56,6 +56,7 @@ struct Arg: public option::Arg {
 enum  optionIndex {
 	UNKNOWN,
 	LIST,
+	DIST,
 	QUERY,
 	OUTPUT,
 	DUMP,
@@ -117,6 +118,11 @@ const option::Descriptor usage[] = {
 		"  --dump, -D <filename> "
 			"\tDump the current index to the given file."
 	},
+	{DIST, 0, "", "dist", Arg::None,
+		"  --dist "
+			"\tGenerate a full, asymmetric distance matrix."
+	},
+
 
 	{LOGO, 0, "",  "logo", Arg::None,
 		"  --logo "
@@ -185,6 +191,8 @@ int main(int argc, char * argv[]){
 
 	if (parse.error()) {
 		cout << "Bad usage!!!" << endl;
+		delete[] options;
+		delete[] buffer;
 		return EXIT_FAILURE;
 	}
 
@@ -194,6 +202,8 @@ int main(int argc, char * argv[]){
 	/**********************************/
 	if (options[HELP] || argc == 0) {
 		option::printUsage(clog, usage,160);
+		delete[] options;
+		delete[] buffer;
 		return EXIT_SUCCESS;
 	}
 
@@ -252,10 +262,9 @@ int main(int argc, char * argv[]){
 		string indexfile = options[LOAD].last()->arg;
 		monindex = new Index(indexfile,out_file);
 	}else{
-		monindex=new Index(F,K,W,E,out_file);
+		monindex = new Index(F,K,W,E,out_file);
 
 	}
-	//TODO PRINT TAILLE bucket
 	time_point<system_clock> start, endindex,end;
 	start = std::chrono::system_clock::now();
 
@@ -271,14 +280,22 @@ int main(int argc, char * argv[]){
 		}
 		changeDirFromFilename(list_file.c_str());
 		DEBUG_MSG("Opening file : '"<<list_file<<"'");
-		monindex->get_filename(list_file.substr(list_file.find_last_of("/\\") + 1));
+		//monindex->get_filename(list_file.substr(list_file.find_last_of("/\\") + 1));
+		monindex->get_filename(list_file);
 		DEBUG_MSG("File added");
 		restoreDir();
 
 	}
+		cout << "OUT LIST" <<endl;
 	if(options[DUMP]) {
+		cout << "DUMP" <<endl;
 		string indexfile = options[DUMP].last()->arg;
 		monindex->dump_index_disk(indexfile);
+	}
+
+	if(options[DIST]) {
+		cout << "DIST" <<endl;
+		monindex->print_matrix();
 	}
 
 	endindex = std::chrono::system_clock::now();
@@ -292,18 +309,17 @@ int main(int argc, char * argv[]){
 
 
 	if (options[QUERY]) {
-	query_file = options[QUERY].last()->arg;
-	ifstream ifs(query_file);
-	if (!ifs) {
-	cout << "Unable to open the file '" << query_file << "'" << endl;
-	}
-	DEBUG_MSG("Opening file...");
-	monindex->query_file(query_file);
-	DEBUG_MSG("Query done.");
+		query_file = options[QUERY].last()->arg;
+		ifstream ifs(query_file);
+		if (!ifs) {
+			cout << "Unable to open the file '" << query_file << "'" << endl;
+		}
+		DEBUG_MSG("Opening file...");
+		monindex->query_file(query_file);
+		DEBUG_MSG("Query done.");
 	}
 
 	DEBUG_MSG("Output the index to :'"<<out_file<<"'");
-	monindex->outfile->close();
 
 	end = std::chrono::system_clock::now();
 	elapsed_seconds = end - endindex;
@@ -318,6 +334,14 @@ int main(int argc, char * argv[]){
 		<< "| E                                 |" << setw(30) << setfill(' ') << E << " |" << endl
 		<< "| Number of indexed genomes         |" << setw(30) << setfill(' ') << monindex->getNbGenomes() << " |" << endl;
 	cout << "+-----------------------------------+-------------------------------+" << endl;
-
+	
+	if(monindex->outfile->is_open()){
+		monindex->outfile->close();
+	} else {
+		std::cerr << "Failed to close index.\n";
+	}
+	delete monindex;
+	delete[] options;
+	delete[] buffer;
 	return EXIT_SUCCESS;
 }
