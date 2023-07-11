@@ -2,3 +2,5 @@ genome1.fasta
 genome1.fasta
 genome2.fasta
 genome3.fasta
+/home/bilbok/Onika/resources/ecoli01p.fa.gz
+/home/bilbok/Onika/resources/ecoli02p.fa.gz

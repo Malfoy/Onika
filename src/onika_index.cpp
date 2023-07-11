@@ -120,7 +120,6 @@ void Index::get_filename(const string& filestr) {
 		ref.clear();
 	}
 
-	cout << endl;
 }
 
 
@@ -371,25 +370,24 @@ void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) cons
 
 
 uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
-	//result = B
 	uint64_t B(hashed);
-	//DEBUG_MSG("B    = '"<<B<<"'");
+	DEBUG_MSG("B    = '"<<B<<"'");
 	B<<=1;
 	B>>=1;
-	//DEBUG_MSG("B>>1 = '"<<B<<"'");
+	DEBUG_MSG("B>>1 = '"<<B<<"'");
 	uint64_t twopowern(1);
 	twopowern<<=63;
 	long double frac=((long double)(twopowern-B))/twopowern;
-	//DEBUG_MSG("-----------------------------------------------------------");
-	//DEBUG_MSG("Frac value : '"<<frac<<"'");
+	DEBUG_MSG("-----------------------------------------------------------");
+	DEBUG_MSG("Frac value : '"<<frac<<"'");
 	// x = taille du sketch/taille du génome
 	frac=pow(frac,E/F);
-	//DEBUG_MSG("E/F = '"<<E<<"/"<<F<<" = "<<E/F<<"'");
-	//DEBUG_MSG("New frac value : '"<<frac<<"'");
+	DEBUG_MSG("E/F = '"<<E<<"/"<<F<<" = "<<E/F<<"'");
+	DEBUG_MSG("New frac value : '"<<frac<<"'");
 	frac=1-frac;
-	//DEBUG_MSG("Fingerprint range : '"<<fingerprint_range<<"'");
-	//DEBUG_MSG("Fingerprint range * frac =  '"<<fingerprint_range*frac<<"'");
-	//DEBUG_MSG("-----------------------------------------------------------");
+	DEBUG_MSG("Fingerprint range : '"<<fingerprint_range<<"'");
+	DEBUG_MSG("Fingerprint range * frac =  '"<<fingerprint_range*frac<<"'");
+	DEBUG_MSG("-----------------------------------------------------------");
 	return fingerprint_range*frac;
 }
 
@@ -400,7 +398,6 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		sketch.resize(F,-1);
 	}
 	DEBUG_MSG("------------------SKETCH--------------------");
-	//~ cout<<"sketch"<<endl;
 	uint empty_cell(F);
 	kmer S_kmer(str2numstrand(reference.substr(0,K-1)));//get the first kmer (k-1 bases)
 	kmer RC_kmer(rcb(S_kmer));//The reverse complement
@@ -422,12 +419,12 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 	sketch_densification(sketch,empty_cell);
 	for(uint64_t i=0; i <sketch.size();++i){
 		//~ cout<<"avant";
-		//DEBUG_MSG("SKETCH avant : '"<<sketch[i]<<"'");
+		DEBUG_MSG("SKETCH avant : '"<<sketch[i]<<"'");
 		//~ cout<<sketch[i]<<" ";
 		sketch[i]=get_perfect_fingerprint(sketch[i]);
 		//~ cout<<"Apres"<<" ";
 		//~ cout<<sketch[i]<<endl;
-		//DEBUG_MSG("SKETCH apres : '"<<sketch[i]<<"'");
+		DEBUG_MSG("SKETCH apres : '"<<sketch[i]<<"'");
 	}
 	DEBUG_MSG("------------------SKETCH END--------------------");
 }
@@ -488,7 +485,7 @@ void Index::dump_index_disk(const string& filestr)const{
 		out.write((filenames[i]+'\n').c_str(),filenames[i].size()+1);
 	}
 }
-
+/*
 void Index::print_matrix() const {
     DEBUG_MSG("PRINT MATRIX: ");
     int size = genome_numbers;
@@ -533,6 +530,67 @@ void Index::print_matrix() const {
                 cout << "-\t";
             else
                 cout << matrix[i][j] << "\t";
+        }
+        cout << endl;
+    }
+}
+*/
+
+void Index::print_matrix() const {
+    DEBUG_MSG("PRINT MATRIX: ");
+    int size = genome_numbers;
+    vector<vector<double>> matrix(size, vector<double>(size)); // Changer le type de la matrice en double pour stocker la distance de Jaccard.
+
+    for(int i = 0; i < size; ++i){
+        DEBUG_MSG("i:'" << i << "' new");
+        auto it_i = file_sketches.find(filenames[i]);
+        if (it_i == file_sketches.end()) {
+            throw std::runtime_error("Key not found");
+        }
+        const vector<uint64_t>& sketch_i = it_i->second;
+        for(int j = i; j < size; ++j){
+            DEBUG_MSG("j:'" << j << "' new");
+            if(i == j){
+                matrix[i][j] = 0.0; // La distance de Jaccard d'un génome à lui-même est 0.
+            } else {
+                auto it_j = file_sketches.find(filenames[j]);
+                if (it_j == file_sketches.end()) {
+                    throw std::runtime_error("Key not found");
+                }
+                const vector<uint64_t>& sketch_j = it_j->second;
+
+                // Calculez l'intersection et l'union des deux sketches.
+                unordered_set<uint64_t> intersection, union_set;
+                for (auto& sketch : sketch_i) {
+                    if (find(sketch_j.begin(), sketch_j.end(), sketch) != sketch_j.end())
+                        intersection.insert(sketch);
+                    union_set.insert(sketch);
+                }
+                for (auto& sketch : sketch_j) {
+                    union_set.insert(sketch);
+                }
+
+                // Calculez la distance de Jaccard et stockez-la dans la matrice.
+                double jaccard_distance = 1.0 - static_cast<double>(intersection.size()) / union_set.size();
+                matrix[i][j] = jaccard_distance;
+                matrix[j][i] = jaccard_distance;
+            }
+        }
+    }
+
+    cout << "##Names ";
+    for (int i = 0; i < size; ++i) {
+        cout << filenames[i] << "\t";
+    }
+    cout << endl;
+
+    for(int i = 0; i < size; ++i) {
+        cout << filenames[i] << "\t";
+        for(int j = 0; j < size; ++j) {
+            if(i == j)
+                cout << "-\t";
+            else
+                cout << fixed << setprecision(3) << matrix[i][j] << "\t"; // Affichez la distance de Jaccard avec 3 chiffres après la virgule.
         }
         cout << endl;
     }

@@ -254,10 +254,15 @@ int main(int argc, char * argv[]){
 		}
 		else cout << "Unable to open file :'"<<logo_name<<"'"<<endl;
 	}
+
+
+
 	cout << "+-------------------------------------------------------------------+" << endl;
 	cout << "|                            Informations                           |" << endl;
 	cout << "+-----------------------------------+-------------------------------+" << endl;
+	
 	Index* monindex;
+
 	if(options[LOAD]){
 		string indexfile = options[LOAD].last()->arg;
 		monindex = new Index(indexfile,out_file);
@@ -286,15 +291,13 @@ int main(int argc, char * argv[]){
 		restoreDir();
 
 	}
-		cout << "OUT LIST" <<endl;
+	
 	if(options[DUMP]) {
-		cout << "DUMP" <<endl;
 		string indexfile = options[DUMP].last()->arg;
 		monindex->dump_index_disk(indexfile);
 	}
 
 	if(options[DIST]) {
-		cout << "DIST" <<endl;
 		monindex->print_matrix();
 	}
 
@@ -333,15 +336,16 @@ int main(int argc, char * argv[]){
 		<< "| W                                 |" << setw(30) << setfill(' ') << W << " |" << endl
 		<< "| E                                 |" << setw(30) << setfill(' ') << E << " |" << endl
 		<< "| Number of indexed genomes         |" << setw(30) << setfill(' ') << monindex->getNbGenomes() << " |" << endl;
-	cout << "+-----------------------------------+-------------------------------+" << endl;
 	
 	if(monindex->outfile->is_open()){
 		monindex->outfile->close();
 	} else {
 		std::cerr << "Failed to close index.\n";
 	}
-	delete monindex;
-	delete[] options;
-	delete[] buffer;
+	//delete monindex;
+
+	cout << "+-------------------------------------------------------------------+" << endl;
+	cout << "|                                  Done                             |" << endl;
+	cout << "+-----------------------------------+-------------------------------+" << endl;
 	return EXIT_SUCCESS;
 }
