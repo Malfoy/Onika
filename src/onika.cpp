@@ -74,43 +74,42 @@ enum  optionIndex {
 
 
 const option::Descriptor usage[] = {
-	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Input***"},
+	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n*** - Input - ***"},
 	{LIST, 0, "I" , "index" ,Arg::NonEmpty,
 		"  --index, -I <filename> "
-			"\tInput file of files to Index.\v"
+			"\tInput file of files to Index."
 	},
 
 	{QUERY, 0, "Q", "query"    , Arg::NonEmpty,
 		"  --query, -Q <filename> "
 			"\tInput file of file to Query.\v"
 	},
-	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Main parameters***"},
+	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n*** - Main parameters - ***"},
 	{OUTPUT, 0, "O", "output", Arg::NonEmpty,
 		"  --output, -O <filename> "
 			"\tOutput file (onikaOutput.gz)"
 	},
 
-	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Main parameters***"},
 	{KMER,  0, "K" , "kmer"  ,Arg::Numeric,
 		"  --kmer, -K <int> "
-			"\tKmer size (31).\v"
+			"\tKmer size (31)."
 	},
 	{FETCH,  0, "S" , "sketch"  ,Arg::Numeric,
 		"  --sketch, -S <int> "
 			"\tSet sketch size to 2^S (15).\v"
 	},
-	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Advanced parameters*** (You know what you are doing)"},
+	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n*** - Advanced parameters - *** (You know what you are doing)"},
 	{WORD,  0, "W" , "word"  ,Arg::Numeric,
 		"  --word, -W <int> "
-			"\tFingerprint size (12). Modify with caution, \
-			larger fingerprints enable queries with less false positive but increase EXPONENTIALY\
-			the overhead as the index count S*2^W cells. \v"
+			"\tFingerprint size (12). Modify with caution,\v"  
+			"larger fingerprints enable queries with less false positive but increase EXPONENTIALY\v"
+			"the overhead as the index count S*2^W cells. "
 	},
 	{EGS,  0, "E" , "EGS"  ,Arg::Numeric,
-		"  --EGS, -E <int> "
-			"\t Expected gemome size (5 000 000).  Modify with caution.\v"
+		"  --egs, -E <int> "
+			"\tExpected gemome size (5 000 000).  Modify with caution.\v"
 	},
-	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n***Index files***"},
+	{UNKNOWN, 0,"" , "" , Arg::Unknown,"\n*** - Index files - ***"},
 	{LOAD, 0, "L", "load", Arg::NonEmpty,
 		"  --load, -L <filename> "
 			"\tLoad an index to the given file."
@@ -209,7 +208,9 @@ int main(int argc, char * argv[]){
 	if (options[HELP] || argc == 0) {
 		option::printUsage(clog, usage,160);
 		delete[] options;
+		options = nullptr;
 		delete[] buffer;
+		buffer = nullptr;
 		return EXIT_SUCCESS;
 	}
 

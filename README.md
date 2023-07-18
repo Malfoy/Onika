@@ -21,15 +21,10 @@ Such file of files should contain one file name or path per line. Each  file wil
 
 Example:
 
-    onika --index my_genomes.txt
+```bash
+    onika --index fof.txt
+```
     
-`--indexlines,`, `-i <file>`             Input file where each line is a separate entry to Index.
-
-Each line of this file representing a DNA sequence will be sketched and inserted as a single entry.
-
-Example:
-
-    onika --indexlines my_genomes.fa
         
 ### 2. Query  :
 
@@ -37,15 +32,29 @@ Example:
 
 Example:
 
+```bash
     onika --query my_genomes.txt
+```
 
 `--querylines,`, `-q <file>`             Input file where each line is a separate entry to Query.
 
 Example:
 
+```bash
     onika --indexlines my_genomes.fa
+```
 
-### 3. Change sketch parameters
+
+### 3. Dist Option
+
+The `--dist` option allows you to generate a full, asymmetric distance matrix, similar to the output provided by DASH. This can be particularly useful for visualizing the distances between different elements in your dataset. 
+
+Usage:
+```bash
+onika -I fof.txt --dist
+```
+
+### 4. Others
 
 `--logo`                           Print ASCII art logo, then exit.
 
