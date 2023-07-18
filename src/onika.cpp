@@ -67,6 +67,7 @@ enum  optionIndex {
 	WORD,
 	MIN,
 	LOGO,
+	INDEX_INFO,
 	HELP
 };
 
@@ -128,10 +129,15 @@ const option::Descriptor usage[] = {
 		"  --logo "
 			"\tPrint ASCII art logo, then exit."
 	},
+	{INDEX_INFO, 0, "N", "indexinfo", Arg::None, 
+		"  --indexinfo, -N" 
+			"\tDisplay index information.\v"
+	},
 
 	{HELP,  0, "h" , "help"  ,Arg::None,
 		"  --help, -h  "
-			"\tPrint usage and exit." },
+			"\tPrint usage and exit." 
+	},
 	{0,0,0,0,0,0}
 };
 
@@ -242,25 +248,22 @@ int main(int argc, char * argv[]){
 	/* Display the ASCII art logo of the program. */
 	/**********************************************/
 	if (options[LOGO]) {
-		string logo_name="../resources/onika.ascii";
-		ifstream logo;
+		string logo_name="resources/onika.ascii";
+		ifstream logo(logo_name.c_str());
 		string line;
-		logo.open(logo_name);
 		if (logo.is_open()){
 			while ( getline (logo,line) ){
 				cout << line << '\n';
 			}
 			logo.close();
 		}
-		else cout << "Unable to open file :'"<<logo_name<<"'"<<endl;
 	}
 
-
-
-	cout << "+-------------------------------------------------------------------+" << endl;
-	cout << "|                            Informations                           |" << endl;
-	cout << "+-----------------------------------+-------------------------------+" << endl;
-	
+	if(options[INDEX_INFO]) {
+		cout << "+-------------------------------------------------------------------+" << endl;
+		cout << "|                            Informations                           |" << endl;
+		cout << "+-----------------------------------+-------------------------------+" << endl;
+	}
 	Index* monindex;
 
 	if(options[LOAD]){
@@ -291,7 +294,7 @@ int main(int argc, char * argv[]){
 		restoreDir();
 
 	}
-	
+
 	if(options[DUMP]) {
 		string indexfile = options[DUMP].last()->arg;
 		monindex->dump_index_disk(indexfile);
@@ -303,8 +306,9 @@ int main(int argc, char * argv[]){
 
 	endindex = std::chrono::system_clock::now();
 	std::chrono::duration<double> elapsed_seconds = endindex - start;
-	cout << "| Indexing lasted (s)               |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
-
+	if(options[INDEX_INFO]) {
+		cout << "| Indexing lasted (s)               |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
+	}
 
 	/*****************************************/
 	/* Add the query file and do the request */
@@ -326,26 +330,28 @@ int main(int argc, char * argv[]){
 
 	end = std::chrono::system_clock::now();
 	elapsed_seconds = end - endindex;
-	cout << "| Query lasted (s)                  |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
-	elapsed_seconds = end - start;
-	cout << "| Whole run lasted (s)              |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
-	cout << "+-----------------------------------+-------------------------------+" << endl;
-	cout << "| k-mer size                        |" << setw(30) << setfill(' ') << K << " |" << endl
-		<< "| S                                 |" << setw(30) << setfill(' ') << F << " |" << endl
-		<< "| Number of fingerprints            |" << setw(30) << setfill(' ') << monindex->F<< " |" << endl
-		<< "| W                                 |" << setw(30) << setfill(' ') << W << " |" << endl
-		<< "| E                                 |" << setw(30) << setfill(' ') << E << " |" << endl
-		<< "| Number of indexed genomes         |" << setw(30) << setfill(' ') << monindex->getNbGenomes() << " |" << endl;
-	
+	if(options[INDEX_INFO]) {
+		cout << "| Query lasted (s)                  |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
+		elapsed_seconds = end - start;
+		cout << "| Whole run lasted (s)              |" << setw(30) << setfill(' ') << elapsed_seconds.count() << " |" << endl;
+		cout << "+-----------------------------------+-------------------------------+" << endl;
+		cout << "| k-mer size                        |" << setw(30) << setfill(' ') << K << " |" << endl
+			<< "| S                                 |" << setw(30) << setfill(' ') << F << " |" << endl
+			<< "| Number of fingerprints            |" << setw(30) << setfill(' ') << monindex->F<< " |" << endl
+			<< "| W                                 |" << setw(30) << setfill(' ') << W << " |" << endl
+			<< "| E                                 |" << setw(30) << setfill(' ') << E << " |" << endl
+			<< "| Number of indexed genomes         |" << setw(30) << setfill(' ') << monindex->getNbGenomes() << " |" << endl;
+	}
 	if(monindex->outfile->is_open()){
 		monindex->outfile->close();
 	} else {
 		std::cerr << "Failed to close index.\n";
 	}
-	//delete monindex;
 
-	cout << "+-------------------------------------------------------------------+" << endl;
-	cout << "|                                  Done                             |" << endl;
-	cout << "+-----------------------------------+-------------------------------+" << endl;
+	if(options[INDEX_INFO]) {
+		cout << "+-------------------------------------------------------------------+" << endl;
+		cout << "|                                  Done                             |" << endl;
+		cout << "+-----------------------------------+-------------------------------+" << endl;
+	}
 	return EXIT_SUCCESS;
 }
