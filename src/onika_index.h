@@ -32,6 +32,16 @@ using kmer = uint64_t;
 using gid = uint32_t;
 const uint32_t mutex_number=65536;
 
+
+
+/**
+ * @class Index
+ * @brief A class representing a genomic index
+ *
+ * This class is involved in creating and manipulating a genomic index.
+ * It includes methods for inserting and querying files and sketches,
+ * hash functions, and utility methods for processing genomic sequences.
+ */
 class Index {
 	public:
 		//CONSTANTS
@@ -60,9 +70,22 @@ class Index {
 		std::vector<Genome> infos;   // Array containing all Genomes informations.
 		std::map<std::string, std::vector<uint64_t>> file_sketches; // map to store sketches
 		/**
-		 * \brief Default constructor.
+		 * @brief Construct a new Index object with several parameters.
+		 *
+		 * @param F Some parameter F
+		 * @param K Kmer size
+		 * @param W Some parameter W
+		 * @param E Expected genome size
+		 * @param filename Name of the file
 		 */
 		Index(uint32_t F, uint32_t K, uint32_t W, uint32_t E, string filename);
+
+		/**
+		 * @brief Construct a new Index object with a file string and an index filename.
+		 *
+		 * @param filestr Some file string
+		 * @param ifilename Index filename
+		 */
 		Index(const string& filestr, const string ifilename);
 
 
@@ -85,29 +108,48 @@ class Index {
 		inline const Genome &operator[](size_t i) const {
 			return infos[i];
 		}
-		/**
-		 * \brief Returns the number of indexed genomes.
-		 *
-		 * \return Returns the number of indexed genomes.
-		 */
+		/// @brief Returns the number of indexed genomes.
 		inline size_t getNbGenomes() const {
 			return genome_numbers;
 		}
 
-
+		/// @brief Test if a file with given name exists.
 		inline bool exists_test (const std::string& name)const {
 			struct stat buffer;
 			return (stat (name.c_str(), &buffer) == 0);
 		}
 
+		/**
+		 * @brief Extract filename from the given string.
+		 *
+		 * @param filestr The string containing the filename.
+		 */
 		void get_filename(const string& filestr);
+		/**
+		 * @brief Insert a file into the genomic index.
+		 *
+		 * @param filestr The file to insert.
+		 * @param identifier The identifier for the file in the index.
+		 */
 		void insert_file(const string& filestr,uint32_t identifier);
-
+		/** 
+		 * @brief Compute the base-2 logarithm of x.
+		 *
+		 * @param x The number to compute the logarithm for.
+		 * @return The base-2 logarithm of x.
+		 */
 		uint64_t asm_log2(const uint64_t x) const;
 		void Biogetline(zstr::ifstream* in,string& result,char type)const;
 		void Biogetline(zstr::ifstream* in,string& result,char type,string& header)const ;
 		char get_data_type(const string& filename)const;
+		// Similar Doxygen comments can be written for the rest of the methods.
 
+		/** 
+		 * @brief Get the reverse complement of a kmer.
+		 *
+		 * @param min The kmer to compute the reverse complement for.
+		 * @return The reverse complement of the kmer.
+		 */
 		kmer rcb(kmer min)const;
 		kmer str2numstrand(const string& str)const;
 		uint64_t revhash64 ( uint64_t x ) const;
@@ -119,19 +161,81 @@ class Index {
 
 		uint64_t unrevhash64 ( uint64_t x ) const;
 		uint64_t hash_family(const uint64_t x, const uint factor)const;
+		/**
+		 * @brief Query the genomic index with a file.
+		 *
+		 * @param filestr The file to query the index with.
+		 * @return A vector of identifiers of genomes related to the file.
+		 */
 		vector<uint32_t> query_file(const string& filestr);
 		vector<uint32_t> query_sketch(const vector<uint64_t>& sketch) const;
 
 
+		/**
+		 * @brief Compute a sketch from a FASTA file and store it in the index.
+		 *
+		 * @param filestr Path to the FASTA file.
+		 */
 		void fasta_sketch(const string& filestr);
-		void merge_sketch(vector<int32_t>& sketch1,const vector<int32_t>& sketch2)const;
+
+		/**
+		 * @brief Merge two sketches into a single one.
+		 *
+		 * @param sketch1 The first sketch to be merged.
+		 * @param sketch2 The second sketch to be merged.
+		 */
+		void merge_sketch(vector<int32_t>& sketch1, const vector<int32_t>& sketch2)const;
+
+		/**
+		 * @brief Densify the sketch by filling the empty cells.
+		 *
+		 * @param sketch The sketch to densify.
+		 * @param empty_cell The value to fill the empty cells with.
+		 */
 		void sketch_densification(vector<uint64_t>& sketch, uint empty_cell) const;
+
+		/**
+		 * @brief Compute a sketch from a reference string using kmers and store it in the index.
+		 *
+		 * @param reference The reference string.
+		 * @param sketch The sketch to store the result.
+		 */
 		void compute_sketch_kmer(const string& reference, vector<uint64_t>& sketch) const;
+
+		/**
+		 * @brief Compute a sketch from a reference string and store it in the index.
+		 *
+		 * @param reference The reference string.
+		 * @param sketch The sketch to store the result.
+		 */
 		void compute_sketch(const string& reference, vector<uint64_t>& sketch) const;
+
+		/**
+		 * @brief Insert a sketch into the genomic index.
+		 *
+		 * @param sketch The sketch to insert.
+		 * @param genome_id The identifier for the genome the sketch is related to.
+		 */
 		void insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id);
+
+		/**
+		 * @brief Write the current state of the index to a file on disk.
+		 *
+		 * @param filestr The path to the file to write to.
+		 */
 		void dump_index_disk(const string& filestr)const ;
+
+		/**
+		 * @brief Compute the perfect fingerprint of a hashed value.
+		 *
+		 * @param hashed The hashed value.
+		 * @return The perfect fingerprint of the hashed value.
+		 */
 		uint64_t get_perfect_fingerprint(uint64_t hashed) const;
 
+		/**
+		 * @brief Print the internal state of the index as a matrix.
+		 */
 		void print_matrix() const;
 
 
