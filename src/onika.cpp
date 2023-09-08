@@ -11,6 +11,7 @@
 #include <fcntl.h> //open
 #include <libgen.h> // dirname
 #include <iomanip> // std::setw
+#include <filesystem>
 #include <zlib.h>
 
 
@@ -281,16 +282,24 @@ int main(int argc, char * argv[]){
 	/* Add the genomes given in config files */
 	/*****************************************/
 	if (options[LIST]) {
+		filesystem::path currentPath = filesystem::current_path();
 		//option::Option* opt = options[LIST];
 		list_file = options[LIST].last()->arg;
-		ifstream ifs(list_file);
-		if (!ifs) {
-			cout << "Unable to open the file '" << list_file << "'" << endl;
+
+		filesystem::path abs_path = filesystem::absolute(list_file);
+
+		if (!filesystem::exists(abs_path)) {
+			cout << "File does not exist at: " << abs_path << endl;
 		}
-		changeDirFromFilename(list_file.c_str());
-		DEBUG_MSG("Opening file : '"<<list_file<<"'");
+
+		ifstream ifs(abs_path);
+		if (!ifs.is_open()) {
+			cout << "Unable to open the file '" << abs_path << "'" << endl;
+		}
+		changeDirFromFilename(abs_path.c_str());
+		DEBUG_MSG("Opening file : '"<<abs_path<<"'");
 		//monindex->get_filename(list_file.substr(list_file.find_last_of("/\\") + 1));
-		monindex->get_filename(list_file);
+		monindex->get_filename(abs_path);
 		DEBUG_MSG("File added");
 		restoreDir();
 
@@ -319,11 +328,11 @@ int main(int argc, char * argv[]){
 	if (options[QUERY]) {
 		query_file = options[QUERY].last()->arg;
 		ifstream ifs(query_file);
-		if (!ifs) {
+		if (not ifs.is_open()) {
 			cout << "Unable to open the file '" << query_file << "'" << endl;
 		}
 		DEBUG_MSG("Opening file...");
-		monindex->query_file(query_file);
+		monindex->query_file_of_file(query_file);
 		DEBUG_MSG("Query done.");
 	}
 

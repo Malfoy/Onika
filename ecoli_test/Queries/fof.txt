@@ -1,0 +1,5 @@
+/home/malfoy/devel/Onika/bastien/Queries/ecoli_0.60.fa.gz
+/home/malfoy/devel/Onika/bastien/Queries/ecoli_0.70.fa.gz
+/home/malfoy/devel/Onika/bastien/Queries/ecoli_0.80.fa.gz
+/home/malfoy/devel/Onika/bastien/Queries/ecoli_0.90.fa.gz
+/home/malfoy/devel/Onika/bastien/Queries/ecoli_1.00.fa.gz

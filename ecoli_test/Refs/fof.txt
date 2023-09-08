@@ -1,0 +1,10 @@
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.00.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.01.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.02.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.03.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.04.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.05.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.06.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.07.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.08.fa.gz
+/home/malfoy/devel/Onika/bastien/Refs/ecoli_0.09.fa.gz

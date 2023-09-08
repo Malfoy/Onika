@@ -42,7 +42,7 @@ AC_ARG_ENABLE([OpenMP],
 		[AX_OPENMP]) 
 
 #dnl Checks for libraries.
-CXXFLAGS="-Wall -std=c++11 -pedantic -funroll-loops -lz -fopenmp"
+CXXFLAGS="-Wall -std=c++17 -pedantic -funroll-loops -lz -fopenmp"
 CXXFLAGS="${CXXFLAGS} ${OPENMP_CXXFLAGS}" 
 CFLAGS="${OPENMP_CFLAGS}" 
 LDFLAGS="${OPENMP_LDFLAG}"

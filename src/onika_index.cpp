@@ -136,7 +136,7 @@ void Index::get_filename(const string& filestr) {
 		DEBUG_MSG("Getline from file :'" << filestr << "' = '" << ref << "'");
 
 		if (ref.size() > 2 && exists_test(ref)) {
-#pragma omp critical (genome_numbers)
+			#pragma omp critical (genome_numbers)
 			{
 				id = genome_numbers;
 				DEBUG_MSG("Genome numbers: " << genome_numbers);
@@ -189,7 +189,7 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
  * @param filestr The name of the file to query.
  * @return A vector of integers representing the results of the queries.
  */
-vector<uint32_t> Index::query_file(const string& filestr) {
+void Index::query_file(const string& filestr) {
 	cout<<"Query:"<<filestr<<endl;
 	char type=get_data_type(filestr);
 	zstr::ifstream in(filestr);
@@ -210,7 +210,21 @@ vector<uint32_t> Index::query_file(const string& filestr) {
 	}
 	*outfile<<endl;
 	cout<<endl;
-	return result;
+	return;
+}
+
+void Index::query_file_of_file(const string& filestr) {
+	cout<<"Query fof:"<<filestr<<endl;
+	zstr::ifstream in(filestr);
+	string ref;
+	while(not in.eof()) {
+		getline(in,ref);
+		if(ref.size()>3) {
+			query_file(ref);
+		}
+		ref.clear();
+	}
+	return;
 }
 
 

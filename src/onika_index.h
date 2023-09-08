@@ -167,7 +167,8 @@ class Index {
 		 * @param filestr The file to query the index with.
 		 * @return A vector of identifiers of genomes related to the file.
 		 */
-		vector<uint32_t> query_file(const string& filestr);
+		void query_file(const string& filestr);
+		void query_file_of_file(const string& filestr);
 		vector<uint32_t> query_sketch(const vector<uint64_t>& sketch) const;
 
 
