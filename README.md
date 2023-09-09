@@ -22,7 +22,7 @@ Such file of files should contain one file name or path per line. Each  file wil
 Example:
 
 ```bash
-    onika --index fof.txt
+    onika --index file_of_file.txt
 ```
     
         
@@ -51,7 +51,7 @@ The `--dist` option allows you to generate a full, asymmetric distance matrix, s
 
 Usage:
 ```bash
-onika -I fof.txt --dist
+onika --index file_of_file.txt --dist --indexinfo
 ```
 
 ### 4. Others
@@ -67,7 +67,7 @@ onika -I fof.txt --dist
 
 ONIKA requires:
 
-* A modern, C++11 ready compiler such as `g++` version 4.9 or higher or `clang` version 3.2 or higher.
+* A modern, C++17 ready compiler such as `g++` version 4.9 or higher or `clang` version 3.2 or higher.
 * A 64-bit operating system. Either Mac OS X or Linux are currently supported.
 * `zlib` to be already installed on your system (on Debian/Ubuntu it corresponds to the packages `zlib1g-dev`).
 
@@ -113,24 +113,19 @@ cd resources
 You can generate a distance matrix from the provided file of files.
 
 ```sh
-onika -M file_of_file.txt -O matrix.gz
+onika --index file_of_file.txt --dist
 ```
 
-And see it with zcat (or gzip -d)
-
-```sh
-zcat matrix.gz 
-```
 By default ONIKA generate a hit list for each query file
  
  ```sh
-onika -I file_of_file.txt -Q file_of_file.txt -O hits.gz -P
+onika --index file_of_file.txt --query file_of_file.txt --output hits.gz 
 zcat hits.gz
 ```
 
 You can change the sketch size depending of our usage (here 1,024 fingerprint per sketch)
  ```sh
-onika -I file_of_file.txt -Q file_of_file.txt -O hitsS10.gz -P -S 10
+onika --index file_of_file.txt --query file_of_file.txt --output hitsS10.gz --sketch 10
 zcat hitsS10.gz
 ```
 ## Credits <a name="cr"></a>
@@ -140,12 +135,12 @@ TODO
 Authors:
 ----------------
 
-* Clément AGRET     <clement.agret@lirmm.fr>
+* Clément AGRET     <clement.agret@cyu.fr>
 * Bastien CAZAUX    <bastien.cazaux@univ-lille.fr>
 * Antoine LIMASSET  <antoine.limasset@univ-lille.fr>
 
 Programmers:
 -------------------------
 
-* Clément AGRET     <clement.agret@lirmm.fr>
+* Clément AGRET     <clement.agret@cyu.fr>
 * Antoine LIMASSET  <antoine.limasset@univ-lille.fr>
