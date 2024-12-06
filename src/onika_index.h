@@ -233,6 +233,7 @@ class Index {
 		 * @return The perfect fingerprint of the hashed value.
 		 */
 		uint64_t get_perfect_fingerprint(uint64_t hashed) const;
+		uint64_t get_perfect_fingerprint2(uint64_t hashed) const;
 
 		/**
 		 * @brief Print the internal state of the index as a matrix.

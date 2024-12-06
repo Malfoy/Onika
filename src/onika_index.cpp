@@ -19,7 +19,7 @@ const int bufferSize = 10000;
  * @param iE Default value is 5000000
  * @param ifilename Default value is "onikaOutput.gz"
  */
-Index::Index(uint32_t ilF=15, uint32_t iK=31,uint32_t iW=12,uint32_t iE=5000000, const string ifilename="onikaOutput.gz") {
+Index::Index(uint32_t ilF=15, uint32_t iK=31,uint32_t iW=12,uint32_t iE=20000, const string ifilename="onikaOutput.gz") {
 	filename=ifilename;
 	lF=ilF;
 	W=iW;
@@ -166,18 +166,25 @@ void Index::get_filename(const string& filestr) {
 void Index::insert_file(const string& filestr,uint32_t identifier) {
 	char type=get_data_type(filestr);
 	zstr::ifstream in(filestr);
-	string ref;
-	vector<uint64_t> kmer_sketch;
-	vector<uint64_t> sketch(F,-1);
-	while(not in.eof()) {
-		Biogetline(&in,ref,type);
-		if(ref.size()>K) {
-			compute_sketch(ref,sketch);
-		}
-		ref.clear();
+	#pragma omp parallel
+	{
+		string ref;
+		vector<uint64_t> kmer_sketch;
+		vector<uint64_t> sketch(F,-1);
+		uint64_t localid;
+		while(not in.eof()) {
+			#pragma omp critical (reading)
+			{
+				Biogetline(&in,ref,type);
+				localid=identifier++;
+			}
+			if(ref.size()>K) {
+				compute_sketch(ref,sketch);
+				insert_sketch(sketch,localid);
+			}
+			ref.clear();
+		}	
 	}
-	file_sketches[filestr] = sketch;
-	insert_sketch(sketch,identifier);
 }
 
 
@@ -420,12 +427,13 @@ kmer Index::str2numstrand(const string& str)const {
  * @param x The 64-bit integer to reverse the hash of.
  * @return The reversed hash.
  */
-uint64_t Index::revhash64 ( uint64_t x ) const {
-	x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
-	x = ((x >> 32) ^ x) * 0xD6E8FEB86659FD93;
-	x = ((x >> 32) ^ x);
-	return x;
-}
+uint64_t Index::revhash64(uint64_t x) const {
+        // Perform xorshift operations
+        x ^= x >> 12;  // Shift right and XOR
+        x ^= x << 25;  // Shift left and XOR
+        x ^= x >> 27;  // Shift right and XOR
+        return x * 0x2545F4914F6CDD1D; // Multiply by a large prime constant
+    }
 
 
 /** 
@@ -437,9 +445,11 @@ uint64_t Index::revhash64 ( uint64_t x ) const {
  * @return The unreversed hash.
  */
 uint64_t Index::unrevhash64(uint64_t x) const{
-	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
-	x = ((x >> 32) ^ x) * 0xCFEE444D8B59A89B;
-	x = ((x >> 32) ^ x);
+        x ^= (x >> 33);  // XOR with right shift by 33
+        x *= 0xff51afd7ed558ccd; // Multiply by a constant
+        x ^= (x >> 33);  // XOR with right shift by 33
+        x *= 0xc4ceb9fe1a85ec53; // Multiply by another constant
+        x ^= (x >> 33);  // Final XOR with right shift by 33
 	return x;
 }
 
@@ -516,6 +526,7 @@ void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) cons
 			}
 		}
 		step++;
+		// cout<<step<<" "<<empty_cell<<endl;
 	}
 }
 
@@ -529,18 +540,68 @@ void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) cons
  * @param hashed The hashed value.
  * @return The perfect fingerprint of the hashed value.
  */
-uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
+
+
+uint64_t Index::get_perfect_fingerprint2(uint64_t hashed) const {
 	// return hashed%fingerprint_range;
-	uint64_t B(hashed);
-	uint64_t twopowern(1);
-	twopowern<<=32;
-	B>>=32;
-	long double frac=((long double)(twopowern-B))/(long double)twopowern;
-	frac=pow(frac,E/F);
-	frac*=fingerprint_range;
-	frac=(long double)fingerprint_range-frac;
-	return frac;
+    uint64_t B = hashed;
+    uint64_t twopowern = 1;
+	uint64_t bits(40);
+    twopowern <<= bits;
+
+    // Shift B to adjust range
+    B >>= (64 - bits);
+
+    // Use logarithmic calculations
+    long double ratio = static_cast<long double>(E) / static_cast<long double>(F);
+
+    // Compute log values
+    long double log_twopowern_minus_B = std::log(static_cast<long double>(twopowern - B));
+    long double log_twopowern = std::log(static_cast<long double>(twopowern));
+
+    // Apply power as a product in log space
+    long double log_top = ratio * log_twopowern_minus_B;
+    long double log_bottom = ratio * log_twopowern;
+
+    // Compute top/bottom in log space
+    long double log_result = std::log(static_cast<long double>(fingerprint_range)) + log_top - log_bottom;
+
+    // Exponentiate to get the result
+    return fingerprint_range-1-static_cast<uint64_t>(std::floor(std::exp(log_result)));
 }
+
+
+uint64_t Index::get_perfect_fingerprint(uint64_t hashed) const {
+    uint64_t B = hashed;
+    uint64_t twopowern = 1;
+    twopowern <<= 32;
+
+    // Shift B to adjust range
+    B >>= (64 - 32);
+
+    // Use long double for higher precision calculations
+    long double ratio = static_cast<long double>(E) / static_cast<long double>(F);
+
+    // Compute top and bottom with explicit casts to long double
+    long double top = (std::pow(static_cast<long double>(twopowern - B), ratio));
+    long double bottom = std::pow(static_cast<long double>(twopowern), ratio);
+
+    // Scale top by fingerprint range
+    top *= static_cast<long double>(fingerprint_range);
+
+	int64_t result(static_cast<uint64_t>(std::floor(static_cast<long double>(fingerprint_range) - top / bottom)));
+	int64_t result2(get_perfect_fingerprint2(hashed));
+	// cout<<result<<" "<<result2<<endl;
+	// cin.get();
+	return result2;
+	if(abs(result-(int64_t)(fingerprint_range/2))<abs(result2-(int64_t)(fingerprint_range/2))){
+	// if(true){
+		return result2;
+	}    // Final computation and floor
+    return result2;
+}
+
+
 
 
 /**
@@ -555,8 +616,11 @@ uint64_t Index::get_perfect_fingerprint(uint64_t hashed)const {
  */
 void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) const {
 	if(sketch.size()!=F) {
-		sketch.resize(F,-1);
+		sketch.resize(F,mi);
+	}else{
+		fill(sketch.begin(), sketch.end(), mi);
 	}
+
 	DEBUG_MSG("------------------SKETCH--------------------");
 	uint empty_cell(F);
 	kmer S_kmer(str2numstrand(reference.substr(0,K-1)));//get the first kmer (k-1 bases)
@@ -567,7 +631,6 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		kmer canon(min(S_kmer,RC_kmer));//Kmer min, the one selected
 		uint64_t fp=revhash64(canon);
 		uint64_t bucket_id(unrevhash64(canon)>>(64-lF));//Which Bucket
-		// uint64_t fp=hashed;
 		//MINHASH
 		if(sketch[bucket_id]==mi){
 			empty_cell--;
@@ -577,12 +640,10 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 		}
 	}
 	sketch_densification(sketch,empty_cell);
+
 	for(uint64_t i=0; i <sketch.size();++i){
-		DEBUG_MSG("SKETCH avant : '"<<sketch[i]<<"'");
 		sketch[i]=get_perfect_fingerprint(sketch[i]);
-		DEBUG_MSG("SKETCH apres : '"<<sketch[i]<<"'");
 	}
-	DEBUG_MSG("------------------SKETCH END--------------------");
 }
 
 
@@ -600,10 +661,10 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
 void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 	for(uint i(0);i<F;++i) {
 		if(sketch[i]<fingerprint_range and sketch[i]>=0){
-			omp_set_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
+			omp_set_lock(&lock[(sketch[i])%mutex_number]);
 			Buckets[sketch[i]].push_back(genome_id);
 			Buckets_pos[sketch[i]].push_back(i);
-			omp_unset_lock(&lock[(sketch[i]+i*fingerprint_range)%mutex_number]);
+			omp_unset_lock(&lock[(sketch[i])%mutex_number]);
 		}
 	}
 }
@@ -669,12 +730,17 @@ void Index::dump_index_disk(const string& filestr)const{
 	out.write(reinterpret_cast<const char*>(&E), sizeof(E));
 	out.write(reinterpret_cast<const char*>(&W), sizeof(W));
 	out.write(reinterpret_cast<const char*>(&genome_numbers), sizeof(genome_numbers));
-	for(uint i(0);i<fingerprint_range*F;++i){
+	uint64_t min(999999999),max(0);
+	for(uint i(0);i<fingerprint_range;++i){
 		uint64_t size(Buckets[i].size());
-		out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-		out.write(reinterpret_cast<const char*>(&(Buckets[i][0])), size*sizeof(gid));
-		out.write(reinterpret_cast<const char*>(&(Buckets_pos[i][0])), size*sizeof(uint16_t));
+		if(min>size){min=size;}
+		if(max<size){max=size;}
+		// cout<<size<<" ";
+		// out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+		// out.write(reinterpret_cast<const char*>(&(Buckets[i][0])), size*sizeof(gid));
+		// out.write(reinterpret_cast<const char*>(&(Buckets_pos[i][0])), size*sizeof(uint16_t));
 	}
+	cout<<'\n'<<min<<" "<<max<<" "<<max-min<<endl;
 	for(uint i(0);i<filenames.size();++i){
 		out.write((filenames[i]+'\n').c_str(),filenames[i].size()+1);
 	}

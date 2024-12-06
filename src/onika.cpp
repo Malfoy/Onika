@@ -7,6 +7,8 @@
 #include <string>
 #include <fstream>
 #include <iostream>
+#include <filesystem>
+
 
 #include <fcntl.h> //open
 #include <libgen.h> // dirname
@@ -222,7 +224,7 @@ int main(int argc, char * argv[]){
 	DEBUG_MSG("K = " << K);
 	F = options[FETCH] ? atoi(options[FETCH].last()->arg) : 15;
 	DEBUG_MSG("F = " << F);
-	E = options[EGS] ? atoi(options[EGS].last()->arg) : 5000000;
+	E = options[EGS] ? atoi(options[EGS].last()->arg) : 10*1000;
 	DEBUG_MSG("E = " << E);
 	W = options[WORD] ? atoi(options[WORD].last()->arg) : 12;
 	DEBUG_MSG("W = " << W);
