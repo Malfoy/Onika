@@ -2,7 +2,6 @@ autom4te.cache/*
 
 libtool
 stamp-h1
-Makefile
 config.status
 config/config.h
 

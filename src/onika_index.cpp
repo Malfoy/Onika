@@ -1,8 +1,7 @@
-#include "strict_fstream.hpp"
-#include "zstr.hpp"
-#include "onika_index.h"
-#include "onika_sketch.h"
-#include "common.h"
+#include "../include/strict_fstream.hpp"
+#include "../include/zstr.hpp"
+#include "../headers/onika_index.h"
+#include "../headers/common.h"
 
 
 
@@ -98,29 +97,12 @@ Index::~Index() {
 
 
 /** 
- * @brief Compute the base-2 logarithm of an unsigned 64-bit integer
- * 
- * This function uses the Bit Scan Reverse (bsr) instruction to find the position of the most significant bit set.
- * 
- * @param x The number to compute the logarithm for.
- * @return The base-2 logarithm of x, or undefined if x is zero.
- */
-uint64_t Index::asm_log2(const uint64_t x) const {
-	uint64_t y;
-	asm ( "\tbsr %1, %0\n"
-			: "=r"(y)
-			: "r" (x)
-	    );
-	return y;
-}
-
-/** 
  * @brief Process the given file, and for each line in the file (which should represent a filename), 
  * it checks whether the file exists and if it does, it inserts it into the index.
  * 
  * @param filestr The name of the file that contains the list of filenames to process.
  */
-void Index::get_filename(const string& filestr) {
+void Index::insert_file_to_index(const string& filestr) {
 	DEBUG_MSG("Opening file : '" << filestr << "'");
 	ifstream in(filestr);
 	if (!in) {
@@ -189,88 +171,6 @@ void Index::insert_file(const string& filestr,uint32_t identifier) {
 
 
 /** 
- * @brief Query the index with the contents of a file.
- * 
- * This function reads the file, generates a sketch of each line, and queries the index with each sketch.
- * The results of each query are written to the output file and also returned as a vector of integers.
- * 
- * @param filestr The name of the file to query.
- * @return A vector of integers representing the results of the queries.
- */
-void Index::query_file(const string& filestr) {
-	char type=get_data_type(filestr);
-	zstr::ifstream in(filestr);
-	string ref;
-	vector<uint64_t> kmer_sketch;
-	vector<uint64_t> sketch(F,-1);
-	while(not in.eof()) {
-		Biogetline(&in,ref,type);
-		if(ref.size()>K) {
-			compute_sketch(ref,sketch);
-		}
-		ref.clear();
-	}
-	auto result(query_sketch(sketch));
-	*outfile<<filestr<<"	";
-	for(uint i(0);i<result.size();++i){
-		*outfile<<(double)1-((double)result[i]/F)<<"	";
-	}
-	*outfile<<endl;
-	return;
-}
-
-void Index::query_file_of_file(const string& filestr) {
-	zstr::ifstream in(filestr);
-	string ref;
-	while(not in.eof()) {
-		getline(in,ref);
-		if(ref.size()>3) {
-			query_file(ref);
-		}
-		ref.clear();
-	}
-	return;
-}
-
-
-
-/**
- * \note The get_fingerprint take hashed a uint64_t.
- * \brief Get the fingerprint.
- *
- * \param idx hashed to set.
- * \brief Returns the result if any.
- *
- */
-
-void Index::Biogetline(zstr::ifstream* in,string& result,char type,string& header)const {
-	string discard;
-	result.clear();
-	switch(type){
-		case 'Q':
-			getline(*in,header);
-			getline(*in,result);
-			getline(*in,discard);
-			getline(*in,discard);
-			break;
-		case 'A':
-			getline(*in,header);
-			char c=in->peek();
-			while(c!='>' and c!=EOF){
-				getline(*in,discard);
-				result+=discard;
-				c=in->peek();
-			}
-			break;
-	}
-	if(result.size()< K){
-		result.clear();
-		header.clear();
-	}
-}
-
-
-/** 
  * @brief Reads a line from the file depending on the data type.
  *
  * This function reads a line or a group of lines from the given file.
@@ -281,7 +181,7 @@ void Index::Biogetline(zstr::ifstream* in,string& result,char type,string& heade
  * @param result The line or group of lines read from the file.
  * @param type The type of file (either 'Q' for fastq or 'A' for fasta).
  */
-void Index::Biogetline(zstr::ifstream* in,string& result,char type)const {
+void Index::Biogetline(zstr::ifstream* in,string& result,char type)const { // USE IT
 	string discard;
 	result.clear();
 	switch(type){
@@ -305,303 +205,6 @@ void Index::Biogetline(zstr::ifstream* in,string& result,char type)const {
 		result.clear();
 	}
 }
-
-
-/** 
- * @brief Determines the data type of a file based on its extension.
- *
- * This function checks the file extension and returns 'Q' for fastq files and 'A' for fasta files.
- * 
- * @param filename The name of the file.
- * @return The type of file ('Q' for fastq or 'A' for fasta).
- */
-char Index::get_data_type(const string& filename)const{
-	if(filename.find(".fq")!=string::npos){
-		return 'Q';
-	}
-	if(filename.find(".fastq")!=string::npos){
-		return 'Q';
-	}
-	return 'A';
-}
-
-
-/** 
- * @brief Computes the reverse complement of a k-mer.
- *
- * This function calculates the reverse complement of a k-mer by reversing the k-mer and switching each nucleotide with its complement.
- * 
- * @param min The k-mer to reverse complement.
- * @return The reverse complement of the k-mer.
- */
-kmer Index::rcb(kmer min)const {
-	kmer res(0);
-	kmer offset(1);
-	offset<<=(2*K-2);
-	for(uint i(0); i<K;++i){
-		res+=(3-(min%4))*offset;
-		min>>=2;
-		offset>>=2;
-	}
-	return res;
-}
-
-
-/** 
- * @brief Converts a nucleotide to an integer.
- *
- * This function maps each nucleotide to an integer as follows: A->0, C->1, G->2, T->3. 
- * If the input character does not represent a valid nucleotide, the function will return 0.
- * 
- * @param c The nucleotide to convert.
- * @return The integer representation of the nucleotide.
- */
-uint64_t Index::nuc2int(char c)const {
-	switch(c){
-		case 'C': return 1;
-		case 'G': return 2;
-		case 'T': return 3;
-		default: return 0;
-	}
-	exit(0);
-	return 0;
-}
-
-
-/** 
- * @brief Converts a nucleotide to an integer, considering the reverse complement.
- *
- * This function maps each nucleotide to an integer as follows: A->3, C->2, G->1, T->0. 
- * If the input character does not represent a valid nucleotide, the function will return 0.
- * 
- * @param c The nucleotide to convert.
- * @return The integer representation of the reverse complement of the nucleotide.
- */
-uint64_t Index::nuc2intrc(char c)const {
-	switch(c) {
-		case 'A': return 3;
-		case 'C': return 2;
-		case 'G': return 1;
-		default: return 0;
-	}
-	exit(0);
-	return 0;
-}
-
-
-/** 
- * @brief Converts a string of nucleotides to a k-mer.
- *
- * This function converts a string of nucleotides to a k-mer by shifting the current k-mer 
- * and adding the integer representation of the next nucleotide in the string.
- * 
- * @param str The string of nucleotides to convert.
- * @return The k-mer representation of the string.
- */
-kmer Index::str2numstrand(const string& str)const {
-	uint64_t res(0);
-	for(uint i(0);i<str.size();i++) {
-		res<<=2;
-		switch (str[i]){
-			case 'A':res+=0;break;
-			case 'C':res+=1;break;
-			case 'G':res+=2;break;
-			case 'T':res+=3;break;
-
-			case 'a':res+=0;break;
-			case 'c':res+=1;break;
-			case 'g':res+=2;break;
-			case 't':res+=3;break;
-			default: return 0 ;break;
-		}
-	}
-	return (res);
-}
-
-
-/** 
- * @brief Reverses the hash of a 64-bit integer.
- *
- * This function reverses the hash of a 64-bit integer by applying a reverse operation.
- * 
- * @param x The 64-bit integer to reverse the hash of.
- * @return The reversed hash.
- */
-uint64_t Index::revhash64(uint64_t x) const {
-        // Perform xorshift operations
-        x ^= x >> 12;  // Shift right and XOR
-        x ^= x << 25;  // Shift left and XOR
-        x ^= x >> 27;  // Shift right and XOR
-        return x * 0x2545F4914F6CDD1D; // Multiply by a large prime constant
-    }
-
-
-/** 
- * @brief Unreverses the hash of a 64-bit integer.
- *
- * This function unreverses the hash of a 64-bit integer by applying an unreversing operation.
- * 
- * @param x The 64-bit integer to unreverse the hash of.
- * @return The unreversed hash.
- */
-uint64_t Index::unrevhash64(uint64_t x) const{
-        x ^= (x >> 33);  // XOR with right shift by 33
-        x *= 0xff51afd7ed558ccd; // Multiply by a constant
-        x ^= (x >> 33);  // XOR with right shift by 33
-        x *= 0xc4ceb9fe1a85ec53; // Multiply by another constant
-        x ^= (x >> 33);  // Final XOR with right shift by 33
-	return x;
-}
-
-
-/** 
- * @brief Updates a k-mer by adding a new nucleotide.
- *
- * This function updates a k-mer by shifting the k-mer, adding the integer representation of 
- * the new nucleotide, and applying a modulus operation with 'offsetUpdatekmer'.
- * 
- * @param min The k-mer to update.
- * @param nuc The new nucleotide to add to the k-mer.
- */
-void Index::update_kmer(kmer& min, char nuc)const {
-	min<<=2;
-	min+=nuc2int(nuc);
-	min%=offsetUpdatekmer;
-}
-
-
-/** 
- * @brief Updates a k-mer for reverse complement string by removing a nucleotide and adding a new nucleotide at the beginning.
- *
- * This function updates a k-mer by shifting the k-mer, adding the integer representation of 
- * the reverse complement of the new nucleotide at the beginning.
- * 
- * @param min The k-mer to update.
- * @param nuc The new nucleotide to add to the k-mer.
- */
-void Index::update_kmer_RC(kmer& min, char nuc)const {
-	min>>=2;
-	min+=(nuc2intrc(nuc)<<(2*K-2));
-}
-
-
-/** 
- * @brief Hashing function that depends on a factor.
- *
- * This function calculates a new hash value based on the input integer and a factor.
- * The hashing function is a combination of unrevhash64 and revhash64.
- * 
- * @param x The input integer to hash.
- * @param factor The factor that influences the hash function.
- * @return The hashed value.
- */
-uint64_t Index::hash_family(const uint64_t x, const uint factor)const{
-	return unrevhash64(x)+factor*revhash64(x);
-}
-
-
-/** 
- * @brief Densifies a sparse MinHash sketch.
- *
- * This function fills the empty cells of a MinHash sketch vector by iteratively
- * applying a hash function and replacing empty cells with hashed values.
- * 
- * @param sketch The MinHash sketch to densify.
- * @param empty_cell The number of empty cells in the sketch.
- */
-void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) const {
-	uint step(0);
-	uint size(sketch.size());
-	while(empty_cell!=0){
-		for(uint i(0);i<size;i++){
-			if(sketch[i]!=mi){
-				uint64_t hash=hash_family(sketch[i],step)%size;
-				if(sketch[hash]==mi){
-					sketch[hash]=sketch[i];
-					empty_cell--;
-					if(empty_cell==0){
-						return;
-					}
-				}
-			}
-		}
-		step++;
-		// cout<<step<<" "<<empty_cell<<endl;
-	}
-}
-
-
-/** 
- * @brief Calculates a perfect fingerprint from a hashed value.
- *
- * This function calculates a perfect fingerprint, which is an integer representation of the density 
- * of the hashed value in the hash space, by applying a transformation to the hashed value.
- * 
- * @param hashed The hashed value.
- * @return The perfect fingerprint of the hashed value.
- */
-
-
-uint64_t Index::get_perfect_fingerprint2(uint64_t hashed) const {
-	// return hashed%fingerprint_range;
-    uint64_t B = hashed;
-    uint64_t twopowern = 1;
-	uint64_t bits(40);
-    twopowern <<= bits;
-
-    // Shift B to adjust range
-    B >>= (64 - bits);
-
-    // Use logarithmic calculations
-    long double ratio = static_cast<long double>(E) / static_cast<long double>(F);
-
-    // Compute log values
-    long double log_twopowern_minus_B = std::log(static_cast<long double>(twopowern - B));
-    long double log_twopowern = std::log(static_cast<long double>(twopowern));
-
-    // Apply power as a product in log space
-    long double log_top = ratio * log_twopowern_minus_B;
-    long double log_bottom = ratio * log_twopowern;
-
-    // Compute top/bottom in log space
-    long double log_result = std::log(static_cast<long double>(fingerprint_range)) + log_top - log_bottom;
-
-    // Exponentiate to get the result
-    return fingerprint_range-1-static_cast<uint64_t>(std::floor(std::exp(log_result)));
-}
-
-
-uint64_t Index::get_perfect_fingerprint(uint64_t hashed) const {
-    uint64_t B = hashed;
-    uint64_t twopowern = 1;
-    twopowern <<= 32;
-
-    // Shift B to adjust range
-    B >>= (64 - 32);
-
-    // Use long double for higher precision calculations
-    long double ratio = static_cast<long double>(E) / static_cast<long double>(F);
-
-    // Compute top and bottom with explicit casts to long double
-    long double top = (std::pow(static_cast<long double>(twopowern - B), ratio));
-    long double bottom = std::pow(static_cast<long double>(twopowern), ratio);
-
-    // Scale top by fingerprint range
-    top *= static_cast<long double>(fingerprint_range);
-
-	int64_t result(static_cast<uint64_t>(std::floor(static_cast<long double>(fingerprint_range) - top / bottom)));
-	int64_t result2(get_perfect_fingerprint2(hashed));
-	// cout<<result<<" "<<result2<<endl;
-	// cin.get();
-	return result2;
-	if(abs(result-(int64_t)(fingerprint_range/2))<abs(result2-(int64_t)(fingerprint_range/2))){
-	// if(true){
-		return result2;
-	}    // Final computation and floor
-    return result2;
-}
-
-
 
 
 /**
@@ -659,6 +262,7 @@ void Index::compute_sketch(const string& reference, vector<uint64_t>& sketch) co
  * \param genome_id The id of the genome that the sketch corresponds to.
  */
 void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
+	cout << genome_id << endl;
 	for(uint i(0);i<F;++i) {
 		if(sketch[i]<fingerprint_range and sketch[i]>=0){
 			omp_set_lock(&lock[(sketch[i])%mutex_number]);
@@ -668,6 +272,171 @@ void Index::insert_sketch(const vector<uint64_t>& sketch,uint32_t genome_id) {
 		}
 	}
 }
+
+
+/** 
+ * @brief Query the index with the contents of a file.
+ * 
+ * This function reads the file, generates a sketch of each line, and queries the index with each sketch.
+ * The results of each query are written to the output file and also returned as a vector of integers.
+ * 
+ * @param filestr The name of the file to query.
+ * @return A vector of integers representing the results of the queries.
+ */
+void Index::query_file(const string& filestr) {
+	char type=get_data_type(filestr);
+	zstr::ifstream in(filestr);
+	string ref;
+	vector<uint64_t> kmer_sketch;
+	vector<uint64_t> sketch(F,-1);
+	while(not in.eof()) {
+		Biogetline(&in,ref,type);
+		if(ref.size()>K) {
+			compute_sketch(ref,sketch);
+		}
+		ref.clear();
+	}
+	auto result(query_sketch(sketch));
+	*outfile<<filestr<<"	";
+	for(uint i(0);i<result.size();++i){
+		*outfile<<(double)1-((double)result[i]/F)<<"	";
+	}
+	*outfile<<endl;
+	return;
+}
+
+void Index::query_file_of_file(const string& filestr) {
+	zstr::ifstream in(filestr);
+	string ref;
+	while(not in.eof()) {
+		getline(in,ref);
+		if(ref.size()>3) {
+			query_file(ref);
+		}
+		ref.clear();
+	}
+	return;
+}
+
+
+/** 
+ * @brief Computes the reverse complement of a k-mer.
+ *
+ * This function calculates the reverse complement of a k-mer by reversing the k-mer and switching each nucleotide with its complement.
+ * 
+ * @param min The k-mer to reverse complement.
+ * @return The reverse complement of the k-mer.
+ */
+kmer Index::rcb(kmer min) const {
+	kmer res(0);
+	kmer offset(1);
+	offset<<=(2*K-2);
+	for(uint i(0); i<K;++i){
+		res+=(3-(min%4))*offset;
+		min>>=2;
+		offset>>=2;
+	}
+	return res;
+}
+
+
+/** 
+ * @brief Updates a k-mer by adding a new nucleotide.
+ *
+ * This function updates a k-mer by shifting the k-mer, adding the integer representation of 
+ * the new nucleotide, and applying a modulus operation with 'offsetUpdatekmer'.
+ * 
+ * @param min The k-mer to update.
+ * @param nuc The new nucleotide to add to the k-mer.
+ */
+void Index::update_kmer(kmer& min, char nuc)const {
+	min<<=2;
+	min+=nuc2int(nuc);
+	min%=offsetUpdatekmer;
+}
+
+
+/** 
+ * @brief Updates a k-mer for reverse complement string by removing a nucleotide and adding a new nucleotide at the beginning.
+ *
+ * This function updates a k-mer by shifting the k-mer, adding the integer representation of 
+ * the reverse complement of the new nucleotide at the beginning.
+ * 
+ * @param min The k-mer to update.
+ * @param nuc The new nucleotide to add to the k-mer.
+ */
+void Index::update_kmer_RC(kmer& min, char nuc)const {
+	min>>=2;
+	min+=(nuc2intrc(nuc)<<(2*K-2));
+}
+
+
+/** 
+ * @brief Densifies a sparse MinHash sketch.
+ *
+ * This function fills the empty cells of a MinHash sketch vector by iteratively
+ * applying a hash function and replacing empty cells with hashed values.
+ * 
+ * @param sketch The MinHash sketch to densify.
+ * @param empty_cell The number of empty cells in the sketch.
+ */
+void Index::sketch_densification(vector<uint64_t>& sketch, uint empty_cell) const {
+	uint step(0);
+	uint size(sketch.size());
+	while(empty_cell!=0){
+		for(uint i(0);i<size;i++){
+			if(sketch[i]!=mi){
+				uint64_t hash=hash_family(sketch[i],step)%size;
+				if(sketch[hash]==mi){
+					sketch[hash]=sketch[i];
+					empty_cell--;
+					if(empty_cell==0){
+						return;
+					}
+				}
+			}
+		}
+		step++;
+	}
+}
+
+
+/** 
+ * @brief Calculates a perfect fingerprint from a hashed value.
+ *
+ * This function calculates a perfect fingerprint, which is an integer representation of the density 
+ * of the hashed value in the hash space, by applying a transformation to the hashed value.
+ * 
+ * @param hashed The hashed value.
+ * @return The perfect fingerprint of the hashed value.
+ */
+uint64_t Index::get_perfect_fingerprint(uint64_t hashed) const {
+	//MINHASH hash modulo 2^W
+    uint64_t B = hashed;
+    uint64_t twopowern = 1;
+    twopowern <<= 32;
+
+    // Shift B to adjust range
+    B >>= (64 - 32);
+
+    // Use long double for higher precision calculations
+    long double ratio = static_cast<long double>(E) / static_cast<long double>(F);
+
+    // Compute top and bottom with explicit casts to long double
+    long double top = (std::pow(static_cast<long double>(twopowern - B), ratio));
+    long double bottom = std::pow(static_cast<long double>(twopowern), ratio);
+
+    // Scale top by fingerprint range
+    top *= static_cast<long double>(fingerprint_range);
+
+	int64_t result(static_cast<uint64_t>(std::floor(static_cast<long double>(fingerprint_range) - top / bottom)));
+	return result;
+}
+
+
+
+
+
 
 
 /**
@@ -735,10 +504,6 @@ void Index::dump_index_disk(const string& filestr)const{
 		uint64_t size(Buckets[i].size());
 		if(min>size){min=size;}
 		if(max<size){max=size;}
-		// cout<<size<<" ";
-		// out.write(reinterpret_cast<const char*>(&size), sizeof(size));
-		// out.write(reinterpret_cast<const char*>(&(Buckets[i][0])), size*sizeof(gid));
-		// out.write(reinterpret_cast<const char*>(&(Buckets_pos[i][0])), size*sizeof(uint16_t));
 	}
 	cout<<'\n'<<min<<" "<<max<<" "<<max-min<<endl;
 	for(uint i(0);i<filenames.size();++i){

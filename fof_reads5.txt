@@ -1,0 +1,1 @@
+example/reads/reads5.fa

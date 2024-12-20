@@ -1,7 +1,6 @@
-#include "onika_index.h"
-#include "onika_sketch.h"
-#include "optionparser.h"
-#include "common.h"
+#include "../headers/onika_index.h"
+#include "../headers/optionparser.h"
+#include "../headers/common.h"
 
 #include <vector>
 #include <string>
@@ -10,9 +9,9 @@
 #include <filesystem>
 
 
-#include <fcntl.h> //open
-#include <libgen.h> // dirname
-#include <iomanip> // std::setw
+#include <fcntl.h>
+#include <libgen.h>
+#include <iomanip>
 #include <filesystem>
 #include <zlib.h>
 
@@ -301,7 +300,7 @@ int main(int argc, char * argv[]){
 		changeDirFromFilename(abs_path.c_str());
 		DEBUG_MSG("Opening file : '"<<abs_path<<"'");
 		//monindex->get_filename(list_file.substr(list_file.find_last_of("/\\") + 1));
-		monindex->get_filename(abs_path);
+		monindex->insert_file_to_index(abs_path);
 		DEBUG_MSG("File added");
 		restoreDir();
 

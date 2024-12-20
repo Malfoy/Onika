@@ -1,0 +1,5 @@
+example/sequences/sequence1.fasta : 5
+example/sequences/sequence2.fasta : 9
+example/sequences/sequence3.fasta : 6
+example/sequences/sequence4.fasta : 9
+example/sequences/sequence5.fasta : 11
