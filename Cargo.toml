@@ -1,0 +1,30 @@
+[package]
+name = "onika_rs"
+version = "0.1.0"
+edition = "2021"
+
+# The dependencies from your previous code
+[dependencies]
+clap = "2.33"
+rayon = "1.5"
+flate2 = "1.0"
+byteorder = "1.4"
+nthash = "0.5.1"  
+croaring = "2.3.1"
+needletail = "0.6.3"
+zstd = "0.13"
+f128 = "0.2"
+num-traits = "0.2"
+stream-vbyte = "0.4.1"
+tempfile =  "3.20.0"
+rlimit = "0.10.2"
+
+
+
+# Release profile for maximum optimization
+[profile.release]
+opt-level = 3      # Tell the compiler to optimize for speed (level 3 is the highest)
+lto = "fat"        # Enable "fat" Link-Time Optimization for whole-program optimization
+codegen-units = 1  # Reduce codegen units to 1 for better optimization opportunities
+panic = "abort"    # Abort on panic for a small performance gain, as unwinding is disabled
+strip = true       # Strip debug symbols from the binary to reduce file size
