@@ -11,7 +11,7 @@ extern crate byteorder;
 mod onika_index;
 mod utils;
 
-use clap::{App, Arg, ArgGroup};
+use clap::{App, SubCommand, Arg, ArgGroup, ArgMatches};
 use onika_index::{Index, IndexBuilder, SketchMode};
 use std::time::Instant;
 use std::fs::File;
@@ -19,14 +19,17 @@ use std::io::{BufReader, BufRead};
 use needletail::parse_fastx_file;
 
 /// Estimates the average document size by sampling the first 100 documents or sequences.
-fn estimate_genome_size(matches: &clap::ArgMatches) -> u32 {
+fn estimate_genome_size(matches: &ArgMatches) -> u32 {
     const SAMPLE_SIZE: usize = 100;
     let mut total_len: u64 = 0;
     let mut doc_count: u64 = 0;
 
     println!("Sampling up to {} documents/sequences to estimate average size...", SAMPLE_SIZE);
+    
+    let fof_path = matches.value_of("input_fof").or(matches.value_of("ref_fof"));
+    let by_line_path = matches.value_of("input_by_line").or(matches.value_of("ref_by_line"));
 
-    if let Some(fof_path) = matches.value_of("index_fof") {
+    if let Some(fof_path) = fof_path {
         let file = File::open(fof_path).expect("Could not open file of files for estimation");
         let reader = BufReader::new(file);
 
@@ -48,7 +51,7 @@ fn estimate_genome_size(matches: &clap::ArgMatches) -> u32 {
                 }
             }
         }
-    } else if let Some(single_file_path) = matches.value_of("index_by_line") {
+    } else if let Some(single_file_path) = by_line_path {
         if let Ok(mut reader) = parse_fastx_file(single_file_path) {
             while let Some(Ok(record)) = reader.next() {
                 if doc_count >= SAMPLE_SIZE as u64 {
@@ -67,192 +70,179 @@ fn estimate_genome_size(matches: &clap::ArgMatches) -> u32 {
     }
 }
 
-
 fn main() {
     let matches = App::new("Onika-rs")
         .version("1.0")
         .author("Rust Translation")
-        .about("A Rust implementation of the Onika indexing tool")
-        .arg(Arg::with_name("index_fof")
-            .short("I")
-            .long("index-fof")
-            .value_name("FILE")
-            .help("Index a file of files, where each file is a document.")
-            .takes_value(true))
-        .arg(Arg::with_name("index_by_line")
-            .short("i")
-            .long("index-by-line")
-            .value_name("FILE")
-            .help("Index a file where each sequence is a document.")
-            .takes_value(true))
-        .group(ArgGroup::with_name("index_mode")
-            .args(&["index_fof", "index_by_line"]))
-        .arg(Arg::with_name("dump")
-            .short("d")
-            .long("dump")
-            .value_name("FILE")
-            .help("File to dump the index to (default: onika_index.bin)")
-            .takes_value(true))
-        .arg(Arg::with_name("load")
-            .short("l")
-            .long("load")
-            .value_name("FILE")
-            .help("Load index from a binary file")
-            .takes_value(true))
-        .arg(Arg::with_name("query_fof")
-            .short("Q")
-            .long("query-fof")
-            .value_name("FILE")
-            .help("Query with a file of files, where each file is a query.")
-            .takes_value(true))
-        .arg(Arg::with_name("query_by_line")
-            .short("q")
-            .long("query-by-line")
-            .value_name("FILE")
-            .help("Query with a file where each line is a query.")
-            .takes_value(true))
-        .group(ArgGroup::with_name("query_mode")
-            .args(&["query_fof", "query_by_line"]))
-        .arg(Arg::with_name("sketch_mode")
-            .long("sketch-mode")
-            .value_name("MODE")
-            .help("Sets the sketching mode [default|perfect].")
-            .default_value("default")
-            .takes_value(true))
-        .arg(Arg::with_name("matrix")
-            .long("matrix")
-            .help("Output results in matrix format instead of the default sparse format."))
-        .arg(Arg::with_name("zstd_level")
-            .long("zstd-level")
-            .value_name("LEVEL")
-            .help("Compression level for zstd (0 for none, default 1).")
-            .takes_value(true))
-        .arg(Arg::with_name("print_stats")
-            .long("print-stats")
-            .help("Prints statistics about the index after construction."))
-        .arg(Arg::with_name("output")
-            .short("o")
-            .long("output")
-            .value_name("FILE")
-            .help("File where the results are written (default: output.txt)")
-            .takes_value(true))
-        .arg(Arg::with_name("w")
-            .short("w")
-            .long("w_size")
-            .value_name("INT")
-            .help("Fingerprint size (default: 12)")
-            .takes_value(true))
-        .arg(Arg::with_name("s")
-            .short("s")
-            .long("s_size")
-            .value_name("INT")
-            .help("Set sketch size to 2^S (default: 15)")
-            .takes_value(true))
-        .arg(Arg::with_name("k")
-            .short("k")
-            .long("k_size")
-            .value_name("INT")
-            .help("K-mer size (default: 31)")
-            .takes_value(true))
-        .arg(Arg::with_name("e")
-            .short("e")
-            .long("e_size")
-            .value_name("INT")
-            .help("Expected genome size. If not provided in perfect mode, it will be estimated.")
-            .takes_value(true))
-        .arg(Arg::with_name("threads")
-            .long("threads")
-            .value_name("INT")
-            .help("Number of threads used (default: 32)")
-            .takes_value(true))
-        .arg(Arg::with_name("threshold")
-            .long("threshold")
-            .value_name("FLOAT")
-            .help("Threshold for query results (default: 0.5)")
-            .takes_value(true))
-        .arg(Arg::with_name("sub_div_factor")
-            .long("sub-div-factor")
-            .value_name("B")
-            .help("Sub-division factor for memory optimization (power of 2).")
-            .default_value("4")
-            .takes_value(true))
+        .about("A tool for MinHash sketching and all-versus-all comparison.")
+        .subcommand(SubCommand::with_name("sketch")
+            .about("Builds sketches from a dataset and saves them to a file.")
+            .arg(Arg::with_name("input_fof")
+                .long("input-fof")
+                .value_name("FILE")
+                .help("Input dataset: a file where each line is a path to a FASTA/Q file.")
+                .takes_value(true))
+            .arg(Arg::with_name("input_by_line")
+                .long("input-by-line")
+                .value_name("FILE")
+                .help("Input dataset: a file where each sequence is a document.")
+                .takes_value(true))
+            .group(ArgGroup::with_name("input_mode")
+                .args(&["input_fof", "input_by_line"])
+                .required(true))
+            .arg(Arg::with_name("output")
+                .short("o")
+                .long("output")
+                .value_name("FILE")
+                .help("Output file to save the sketch index (.bin).")
+                .required(true)
+                .takes_value(true))
+            .arg(Arg::with_name("k").short("k").long("k_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
+            .arg(Arg::with_name("sub_div_factor").long("sub-div-factor").value_name("B").default_value("4").takes_value(true))
+            .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
+        )
+        .subcommand(SubCommand::with_name("compare")
+            .about("Compares two datasets, which can be raw files or pre-computed sketches.")
+            .arg(Arg::with_name("ref_fof").long("ref-fof").value_name("FILE").takes_value(true))
+            .arg(Arg::with_name("ref_by_line").long("ref-by-line").value_name("FILE").takes_value(true))
+            .arg(Arg::with_name("ref_sketch").long("ref-sketch").value_name("FILE").takes_value(true))
+            .group(ArgGroup::with_name("reference")
+                .args(&["ref_fof", "ref_by_line", "ref_sketch"])
+                .required(true))
+            .arg(Arg::with_name("query_fof").long("query-fof").value_name("FILE").takes_value(true))
+            .arg(Arg::with_name("query_by_line").long("query-by-line").value_name("FILE").takes_value(true))
+            .arg(Arg::with_name("query_sketch").long("query-sketch").value_name("FILE").takes_value(true))
+            .group(ArgGroup::with_name("query")
+                .args(&["query_fof", "query_by_line", "query_sketch"])
+                .required(true))
+            .arg(Arg::with_name("output").short("o").long("output").value_name("FILE").default_value("output.txt").takes_value(true))
+            .arg(Arg::with_name("threshold").long("threshold").value_name("FLOAT").default_value("0.0").takes_value(true))
+            .arg(Arg::with_name("matrix").long("matrix"))
+            .arg(Arg::with_name("print_stats").long("print-stats"))
+            .arg(Arg::with_name("k").short("k").long("k_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
+            .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
+            .arg(Arg::with_name("sub_div_factor").long("sub-div-factor").value_name("B").default_value("4").takes_value(true))
+            .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
+        )
         .get_matches();
 
-    if !matches.is_present("load") && !matches.is_present("index_mode") {
-        println!("Error: An indexing mode (-I or -i) is required when not loading an index with -l.");
-        return;
-    }
-
-    let w = value_t!(matches, "w", u32).unwrap_or(16);
-    let s = value_t!(matches, "s", u32).unwrap_or(16);
-    let k = value_t!(matches, "k", u32).unwrap_or(31);
-    let threads = value_t!(matches, "threads", u16).unwrap_or(32);
-    let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
-    let output = matches.value_of("output").unwrap_or("output.txt");
-    let is_matrix = matches.is_present("matrix");
-    let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
-    
-    let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
-        "perfect" => SketchMode::Perfect,
-        _ => SketchMode::Default,
-    };
-
-    let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(1);
-
-    let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
-        println!("Perfect fingerprinting mode enabled without -e flag. Estimating genome size...");
-        let estimated_e = estimate_genome_size(&matches);
-        println!("Estimated genome size (e): {}", estimated_e);
-        estimated_e
-    } else {
-        value_t!(matches, "e", u32).unwrap_or(5_000_000)
-    };
-
-    rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build_global().unwrap();
-
-    let index = if let Some(load_file) = matches.value_of("load") {
-        let start_loading = Instant::now();
-        println!("ONIKA INDEX LOADING from {}", load_file);
-        let index = Index::from_file(load_file).expect("Failed to load index");
-        println!("Loading took {} seconds.", start_loading.elapsed().as_secs());
-        index
-    } else {
-        let start_indexing = Instant::now();
-        let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor,1024);
+    if let Some(matches) = matches.subcommand_matches("sketch") {
+        let w = value_t!(matches, "w", u32).unwrap_or(16);
+        let s = value_t!(matches, "s", u32).unwrap_or(16);
+        let k = value_t!(matches, "k", u32).unwrap_or(31);
+        let threads = value_t!(matches, "threads", u16).unwrap_or(32);
+        let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
+            "perfect" => SketchMode::Perfect,
+            _ => SketchMode::Default,
+        };
+        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(1);
+        let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
+        let output_file = matches.value_of("output").unwrap();
         
-        if let Some(fof) = matches.value_of("index_fof") {
-            println!("Indexing file of files: {}", fof);
+        let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
+            let estimated_e = estimate_genome_size(matches);
+            println!("Estimated genome size (e): {}", estimated_e);
+            estimated_e
+        } else {
+            value_t!(matches, "e", u32).unwrap_or(5_000_000)
+        };
+
+        rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build_global().unwrap();
+        
+        println!("--- Building Sketch Index ---");
+        let start_time = Instant::now();
+        let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
+
+        if let Some(fof) = matches.value_of("input_fof") {
             builder.index_file_of_files(fof);
-        } else if let Some(line_file) = matches.value_of("index_by_line") {
-            println!("Indexing file by line: {}", line_file);
+        } else if let Some(line_file) = matches.value_of("input_by_line") {
             builder.index_file_line_by_line(line_file);
         }
-
-        let final_index = builder.into_final_index();
-        println!("Indexing took {} seconds.", start_indexing.elapsed().as_secs());
-
-        if let Some(dump_file) = matches.value_of("dump") {
-             println!("Dumping index to file: {}", dump_file);
-             if let Err(e) = final_index.dump_index_disk(dump_file, zstd_level) {
-                 eprintln!("Error dumping index: {}", e);
-             }
+        
+        let index = builder.into_final_index();
+        println!("Sketching took {} seconds.", start_time.elapsed().as_secs());
+        
+        println!("Dumping sketch index to file: {}", output_file);
+        if let Err(e) = index.dump_index_disk(output_file, zstd_level) {
+            eprintln!("Error dumping index: {}", e);
         }
-        final_index
-    };
 
-    if matches.is_present("print_stats") {
-        index.print_stats();
-    }
+    } else if let Some(matches) = matches.subcommand_matches("compare") {
+        let w = value_t!(matches, "w", u32).unwrap_or(16);
+        let s = value_t!(matches, "s", u32).unwrap_or(16);
+        let k = value_t!(matches, "k", u32).unwrap_or(31);
+        let threads = value_t!(matches, "threads", u16).unwrap_or(32);
+        let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
+            "perfect" => SketchMode::Perfect,
+            _ => SketchMode::Default,
+        };
+        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(1);
+        let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
+        let output_file = matches.value_of("output").unwrap();
+        let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
+        let is_matrix = matches.is_present("matrix");
 
-    if let Some(fof) = matches.value_of("query_fof") {
-        println!("\nONIKA QUERY with file of files: {}", fof);
-        let start_query = Instant::now();
-        index.query_file_of_file(fof, threshold, is_matrix, zstd_level, output);
-        println!("Querying took {} seconds.", start_query.elapsed().as_secs());
-    } else if let Some(line_file) = matches.value_of("query_by_line") {
-        println!("\nONIKA QUERY by line: {}", line_file);
-        let start_query = Instant::now();
-        index.query_file_line_by_line(line_file, threshold, is_matrix, zstd_level, output);
-        println!("Querying took {} seconds.", start_query.elapsed().as_secs());
+        let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
+            let estimated_e = estimate_genome_size(matches);
+            println!("Estimated genome size (e): {}", estimated_e);
+            estimated_e
+        } else {
+            value_t!(matches, "e", u32).unwrap_or(5_000_000)
+        };
+
+        rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build_global().unwrap();
+        
+        // --- Process Reference Input ---
+        let ref_index = if let Some(sketch_file) = matches.value_of("ref_sketch") {
+            Index::from_file(sketch_file).expect("Failed to load reference sketch file")
+        } else {
+            println!("--- Building Reference Index On-the-fly ---");
+            let start_ref_indexing = Instant::now();
+            let ref_builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
+            if let Some(fof) = matches.value_of("ref_fof") {
+                ref_builder.index_file_of_files(fof);
+            } else if let Some(line_file) = matches.value_of("ref_by_line") {
+                ref_builder.index_file_line_by_line(line_file);
+            }
+            let index = ref_builder.into_final_index();
+            println!("Reference indexing took {} seconds.", start_ref_indexing.elapsed().as_secs());
+            index
+        };
+
+        // --- Process Query Input ---
+        let query_index = if let Some(sketch_file) = matches.value_of("query_sketch") {
+            Index::from_file(sketch_file).expect("Failed to load query sketch file")
+        } else {
+            println!("\n--- Building Query Index On-the-fly ---");
+            let start_query_indexing = Instant::now();
+            let query_builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
+            if let Some(fof) = matches.value_of("query_fof") {
+                query_builder.index_file_of_files(fof);
+            } else if let Some(line_file) = matches.value_of("query_by_line") {
+                query_builder.index_file_line_by_line(line_file);
+            }
+            let index = query_builder.into_final_index();
+            println!("Query indexing took {} seconds.", start_query_indexing.elapsed().as_secs());
+            index
+        };
+        
+        if matches.is_present("print_stats") {
+            println!("\n--- Reference Index Stats ---");
+            ref_index.print_stats();
+            println!("\n--- Query Index Stats ---");
+            query_index.print_stats();
+        }
+        
+        // --- Perform Comparison ---
+        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file);
     }
 }

@@ -11,7 +11,9 @@ use num_traits::{Float, ToPrimitive};
 use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
 use tempfile::TempDir;
 use rlimit;
-use stream_vbyte::{encode::encode, decode::decode, scalar::Scalar};
+use stream_vbyte::{decode::decode, scalar::Scalar};
+use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 
 
 type Gid = u32;
@@ -365,7 +367,7 @@ impl IndexBuilder {
 
 impl Index {
     pub fn from_file(filestr: &str) -> std::io::Result<Self> {
-        println!("Loading index from disk...");
+        println!("Loading index from disk: {}...", filestr);
         let mut file = File::open(filestr)?;
         let mut compressed_buffer = Vec::new();
         file.read_to_end(&mut compressed_buffer)?;
@@ -483,44 +485,137 @@ impl Index {
         println!("L3 Norm of list sizes: {:.4}", l3_norm);
     }
     
-    pub fn query_sketch(&self, sketch: &[u64]) -> Vec<u32> {
-        let mut res = vec![0u32; self.genome_numbers as usize];
-        let b_mask = (1u32 << self.b) - 1;
-        let b_shift = self.b;
-
-        for (i, &fp) in sketch.iter().enumerate() {
-            if fp < self.fingerprint_range {
-                let flat_index = (fp * self.sketch_size) + i as u64;
-                let new_index = (flat_index >> b_shift) as usize;
-                let target_offset = (flat_index as u32) & b_mask;
-
-                if new_index < self.data.len() {
-                    let (original_count, compressed_gids) = &self.data[new_index];
-                    if *original_count > 0 {
-                        // Decompress the GID list on-the-fly.
-                        let mut decoded_deltas = vec![0u32; *original_count as usize];
-                        stream_vbyte::decode::decode::<stream_vbyte::scalar::Scalar>(compressed_gids, *original_count as usize, &mut decoded_deltas);
-                        
-                        // Undo delta encoding (cumulative sum) to get original GIDs.
-                        for j in 1..decoded_deltas.len() {
-                            decoded_deltas[j] = decoded_deltas[j].wrapping_add(decoded_deltas[j-1]);
-                        }
-
-                        // Now `decoded_deltas` holds the actual encoded GIDs.
-                        for &encoded_gid in &decoded_deltas {
-                            let offset = encoded_gid & b_mask;
-                            if offset == target_offset {
+    /// Performs an all-versus-all comparison between this index (reference) and another (query).
+    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str) {
+        println!("\n--- Starting All-Versus-All Comparison ---");
+        let start_time = std::time::Instant::now();
+    
+        let num_queries = query_index.genome_numbers as usize;
+        let num_refs = self.genome_numbers as usize;
+    
+        let total_indices = self.data.len();
+        if total_indices != query_index.data.len() {
+            panic!("Incompatible indices for comparison: different total sizes.");
+        }
+        
+        // Parallel map-reduce for score calculation to avoid lock contention
+        let final_scores_map: HashMap<(u32, u32), u32> = (0..total_indices)
+            .into_par_iter()
+            .fold(
+                || HashMap::new(),
+                |mut local_scores, flat_index| {
+                    let (ref_count, ref_compressed) = &self.data[flat_index];
+                    if *ref_count > 0 {
+                        let (query_count, query_compressed) = &query_index.data[flat_index];
+                        if *query_count > 0 {
+                            // Decompress and decode reference GIDs
+                            let mut ref_decoded_deltas = vec![0u32; *ref_count as usize];
+                            decode::<Scalar>(ref_compressed, *ref_count as usize, &mut ref_decoded_deltas);
+                            for j in 1..ref_decoded_deltas.len() {
+                                ref_decoded_deltas[j] = ref_decoded_deltas[j].wrapping_add(ref_decoded_deltas[j-1]);
+                            }
+    
+                            // Decompress and decode query GIDs
+                            let mut query_decoded_deltas = vec![0u32; *query_count as usize];
+                            decode::<Scalar>(query_compressed, *query_count as usize, &mut query_decoded_deltas);
+                            for j in 1..query_decoded_deltas.len() {
+                                query_decoded_deltas[j] = query_decoded_deltas[j].wrapping_add(query_decoded_deltas[j-1]);
+                            }
+                            
+                            let b_mask = (1u32 << self.b) - 1;
+                            let b_shift = self.b;
+                            
+                            let mut ref_gids_by_offset: HashMap<u32, Vec<u32>> = HashMap::new();
+                            for &encoded_gid in &ref_decoded_deltas {
+                                let offset = encoded_gid & b_mask;
                                 let gid = encoded_gid >> b_shift;
-                                if (gid as usize) < res.len() {
-                                    res[gid as usize] += 1;
+                                ref_gids_by_offset.entry(offset).or_default().push(gid);
+                            }
+    
+                            let mut query_gids_by_offset: HashMap<u32, Vec<u32>> = HashMap::new();
+                            for &encoded_gid in &query_decoded_deltas {
+                                let offset = encoded_gid & b_mask;
+                                let gid = encoded_gid >> b_shift;
+                                query_gids_by_offset.entry(offset).or_default().push(gid);
+                            }
+                            
+                            // Find common offsets and increment scores for all pairs
+                            for (offset, ref_gids) in ref_gids_by_offset.iter() {
+                                if let Some(query_gids) = query_gids_by_offset.get(offset) {
+                                    for &query_gid in query_gids {
+                                        for &ref_gid in ref_gids {
+                                            *local_scores.entry((query_gid, ref_gid)).or_insert(0) += 1;
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                    local_scores
+                },
+            )
+            .reduce(
+                || HashMap::new(),
+                |mut a, b| {
+                    for (k, v) in b {
+                        *a.entry(k).or_insert(0) += v;
+                    }
+                    a
+                },
+            );
+    
+        println!("Score calculation finished in {} seconds. Formatting and writing results...", start_time.elapsed().as_secs());
+    
+        // Convert HashMap to a format that is easier to process for output (grouped by query GID)
+        let mut scores_by_query: Vec<Vec<(Gid, u32)>> = vec![Vec::new(); num_queries];
+        for ((query_gid, ref_gid), count) in final_scores_map {
+            if (query_gid as usize) < num_queries {
+                scores_by_query[query_gid as usize].push((ref_gid, count));
             }
         }
-        res
+        
+        let mut writer = self.create_writer(output_file, zstd_level);
+    
+        for query_gid in 0..num_queries {
+            let mut line = String::new();
+            // Using generic "query_GID" as we don't have file names here
+            write!(&mut line, "query_{}\t", query_gid).unwrap();
+            
+            let res = &scores_by_query[query_gid];
+    
+            if is_matrix {
+                // Reconstruct the full row for the matrix format
+                let mut full_row = vec![0.0; num_refs];
+                for &(ref_gid, count) in res {
+                    if (ref_gid as usize) < num_refs {
+                        full_row[ref_gid as usize] = count as f64 / self.s as f64;
+                    }
+                }
+                let similarities: Vec<String> = full_row.iter().map(|&similarity| {
+                    if similarity >= threshold {
+                        format!("{:.4}", similarity)
+                    } else {
+                        "0.0000".to_string()
+                    }
+                }).collect();
+                line.push_str(&similarities.join(","));
+            } else { // Sparse format
+                let mut hits: Vec<(Gid, f64)> = res.iter()
+                    .map(|&(ref_gid, count)| {
+                        let sim = count as f64 / self.s as f64;
+                        (ref_gid, sim)
+                    })
+                    .filter(|&(_, sim)| sim >= threshold)
+                    .collect();
+                
+                hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                
+                line.push_str(&hits.iter().map(|(gid, sim)| format!("{}:{:.4}", gid, sim)).collect::<Vec<String>>().join(","));
+            }
+            writeln!(writer, "{}", line).unwrap();
+        }
+        
+        println!("All-vs-all comparison complete. Results written to {}.", output_file);
     }
 
     fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
@@ -529,182 +624,6 @@ impl Index {
             Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish())
         } else {
             Box::new(BufWriter::new(file))
-        }
-    }
-
-    pub fn query_file_of_file(&self, filestr: &str, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str) {
-        let file = File::open(filestr).unwrap();
-        let files_to_query: Vec<String> = BufReader::new(file).lines().filter_map(Result::ok).collect();
-        
-        let results: Vec<String> = files_to_query.par_iter().flat_map(|query_filename| {
-            self.process_single_query_file_to_strings(query_filename, threshold, is_matrix)
-        }).collect();
-
-        let mut writer = self.create_writer(output_file, zstd_level);
-        for line in results {
-            writeln!(writer, "{}", line).unwrap();
-        }
-    }
-    
-    pub fn query_file_line_by_line(&self, filestr: &str, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str) {
-        let file = File::open(filestr).unwrap();
-        let lines: Vec<String> = BufReader::new(file).lines().filter_map(Result::ok).collect();
-        
-        let results: Vec<String> = lines.par_iter().enumerate().filter_map(|(i, query_seq)| {
-            let mut sketch = vec![self.mi; self.s as usize];
-            self.compute_sketch(SketchInput::Sequence(query_seq.as_bytes()), &mut sketch);
-            if sketch.iter().all(|&x| x == self.mi) {
-                None
-            } else {
-                let result_vec = self.query_sketch(&sketch);
-                let query_id = format!("line_{}", i + 1);
-                Some(self.format_results_to_string(&query_id, &result_vec, threshold, is_matrix))
-            }
-        }).collect();
-
-        let mut writer = self.create_writer(output_file, zstd_level);
-        for line in results {
-            writeln!(writer, "{}", line).unwrap();
-        }
-    }
-
-    fn process_single_query_file_to_strings(&self, filestr: &str, threshold: f64, is_matrix: bool) -> Vec<String> {
-        let mut results = Vec::new();
-        let mut sketch = vec![self.mi; self.s as usize];
-
-        self.compute_sketch(SketchInput::FilePath(filestr), &mut sketch);
-
-        if !sketch.iter().all(|&x| x == self.mi) {
-            let result_vec = self.query_sketch(&sketch);
-            let query_id = filestr; 
-            results.push(self.format_results_to_string(query_id, &result_vec, threshold, is_matrix));
-        }
-        
-        results
-    }
-    
-    fn format_results_to_string(&self, query_id: &str, res: &[u32], threshold: f64, is_matrix: bool) -> String {
-        let mut line = format!("{}\t", query_id);
-
-        if is_matrix {
-            let similarities: Vec<String> = res.iter().map(|&count| {
-                let similarity = count as f64 / self.s as f64;
-                if similarity >= threshold {
-                    format!("{:.4}", similarity)
-                } else {
-                    "0.0000".to_string()
-                }
-            }).collect();
-            line.push_str(&similarities.join(","));
-        } else {
-            let mut hits: Vec<(Gid, f64)> = res.iter().enumerate()
-                .map(|(gid, &count)| (gid as u32, count as f64 / self.s as f64))
-                .filter(|&(_, sim)| sim >= threshold)
-                .collect();
-            
-            hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            
-            line.push_str(&hits.iter().map(|(gid, sim)| format!("{}:{:.4}", gid, sim)).collect::<Vec<String>>().join(","));
-        }
-        line
-    }
-
-    fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
-        sketch.fill(self.mi);
-        let mut empty_cell = self.s;
-        let is_valid_dna = |c: &u8| matches!(*c, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
-
-        let mut update_sketch = |sequence: &[u8]| {
-            for subseq in sequence.split(|c| !is_valid_dna(c)) {
-                if subseq.len() >= self.k as usize {
-                    let h_iter = NtHashIterator::new(subseq, self.k as usize).unwrap();
-                    for canon_hash in h_iter {
-                        let fp = revhash64(canon_hash);
-                        let bucket_id = (unrevhash64(canon_hash) >> (64 - self.ls)) as usize;
-                        if bucket_id < sketch.len() {
-                            if sketch[bucket_id] == self.mi {
-                                empty_cell -= 1;
-                                sketch[bucket_id] = fp;
-                            } else if sketch[bucket_id] > fp {
-                                sketch[bucket_id] = fp;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        match input {
-            SketchInput::Sequence(seq) => update_sketch(seq),
-            SketchInput::FilePath(path) => {
-                if let Ok(mut file_reader) = parse_fastx_file(path) {
-                    while let Some(Ok(record)) = file_reader.next() {
-                        update_sketch(&record.seq());
-                    }
-                }
-            }
-        }
-
-        if empty_cell < self.s {
-            self.sketch_densification(sketch, empty_cell as u32);
-            for val in sketch.iter_mut() {
-                if *val != self.mi {
-                    *val = match self.sketch_mode {
-                        SketchMode::Default => *val & (self.fingerprint_range - 1),
-                        SketchMode::Perfect => self.get_perfect_fingerprint(*val),
-                    };
-                }
-            }
-        }
-    }
-
-    fn sketch_densification(&self, sketch: &mut Vec<u64>, mut empty_cell: u32) {
-        let mut step = 0;
-        let size = sketch.len();
-        while empty_cell != 0 {
-            let mut changes = Vec::new();
-            for i in 0..size {
-                if sketch[i] != self.mi {
-                    let hash_pos = (hash_family(sketch[i], step) % size as u64) as usize;
-                     if hash_pos < sketch.len() && sketch[hash_pos] == self.mi {
-                       changes.push((hash_pos, sketch[i]));
-                    }
-                }
-            }
-            if changes.is_empty() && empty_cell > 0 {
-                break;
-            }
-
-            for (pos, val) in changes {
-                 if sketch[pos] == self.mi { 
-                    sketch[pos] = val;
-                    empty_cell -= 1;
-                    if empty_cell == 0 {
-                        return;
-                    }
-                 }
-            }
-            step += 1;
-        }
-    }
-
-    fn get_perfect_fingerprint(&self, hashed: u64) -> u64 {
-        if hashed == self.mi { return self.mi; }
-    
-        let b = f128::from(hashed >> 32);
-        let twopowern = f128::from(1u128 << 32);
-        let ratio = f128::from(self.e) / f128::from(self.s);
-    
-        let top = (twopowern - b).powf(ratio);
-        let bottom = twopowern.powf(ratio);
-    
-        let scaled_top = f128::from(self.fingerprint_range) * top;
-        let result_f = f128::from(self.fingerprint_range) - (scaled_top / bottom);
-    
-        if result_f < f128::from(0.0) {
-            0
-        } else {
-            result_f.floor().to_u64().unwrap_or(0)
         }
     }
 }
