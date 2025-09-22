@@ -12,11 +12,9 @@ mod onika_index;
 mod utils;
 
 use clap::{App, SubCommand, Arg, ArgGroup, ArgMatches};
-use onika_index::{Index, IndexBuilder, SketchMode};
+use onika_index::{Index, IndexBuilder, SketchMode, open_compressed_file};
 use std::time::Instant;
-use std::fs::File;
 use std::io::{BufReader, BufRead};
-use needletail::parse_fastx_file;
 
 /// Estimates the average document size by sampling the first 100 documents or sequences.
 fn estimate_genome_size(matches: &ArgMatches) -> u32 {
@@ -30,35 +28,38 @@ fn estimate_genome_size(matches: &ArgMatches) -> u32 {
     let by_line_path = matches.value_of("input_by_line").or(matches.value_of("ref_by_line"));
 
     if let Some(fof_path) = fof_path {
-        let file = File::open(fof_path).expect("Could not open file of files for estimation");
-        let reader = BufReader::new(file);
+        if let Ok(reader) = open_compressed_file(fof_path) {
+            'outer: for filepath_res in reader.lines() {
+                if let Ok(filepath) = filepath_res {
+                    if let Ok(reader) = open_compressed_file(&filepath) {
+                        if let Ok(mut file_reader) = needletail::parse_fastx_reader(reader) {
+                            let mut current_doc_size: u64 = 0;
+                            while let Some(Ok(record)) = file_reader.next() {
+                                current_doc_size += record.seq().len() as u64;
+                            }
 
-        'outer: for filepath_res in reader.lines() {
-            if let Ok(filepath) = filepath_res {
-                if let Ok(mut file_reader) = parse_fastx_file(&filepath) {
-                    let mut current_doc_size: u64 = 0;
-                    while let Some(Ok(record)) = file_reader.next() {
-                        current_doc_size += record.seq().len() as u64;
-                    }
-
-                    if current_doc_size > 0 {
-                        total_len += current_doc_size;
-                        doc_count += 1;
-                        if doc_count >= SAMPLE_SIZE as u64 {
-                            break 'outer;
+                            if current_doc_size > 0 {
+                                total_len += current_doc_size;
+                                doc_count += 1;
+                                if doc_count >= SAMPLE_SIZE as u64 {
+                                    break 'outer;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
     } else if let Some(single_file_path) = by_line_path {
-        if let Ok(mut reader) = parse_fastx_file(single_file_path) {
-            while let Some(Ok(record)) = reader.next() {
-                if doc_count >= SAMPLE_SIZE as u64 {
-                    break;
+        if let Ok(reader) = open_compressed_file(single_file_path) {
+            if let Ok(mut fastx_reader) = needletail::parse_fastx_reader(reader) {
+                while let Some(Ok(record)) = fastx_reader.next() {
+                    if doc_count >= SAMPLE_SIZE as u64 {
+                        break;
+                    }
+                    total_len += record.seq().len() as u64;
+                    doc_count += 1;
                 }
-                total_len += record.seq().len() as u64;
-                doc_count += 1;
             }
         }
     }
@@ -77,26 +78,11 @@ fn main() {
         .about("A tool for MinHash sketching and all-versus-all comparison.")
         .subcommand(SubCommand::with_name("sketch")
             .about("Builds sketches from a dataset and saves them to a file.")
-            .arg(Arg::with_name("input_fof")
-                .long("input-fof")
-                .value_name("FILE")
-                .help("Input dataset: a file where each line is a path to a FASTA/Q file.")
-                .takes_value(true))
-            .arg(Arg::with_name("input_by_line")
-                .long("input-by-line")
-                .value_name("FILE")
-                .help("Input dataset: a file where each sequence is a document.")
-                .takes_value(true))
-            .group(ArgGroup::with_name("input_mode")
-                .args(&["input_fof", "input_by_line"])
-                .required(true))
-            .arg(Arg::with_name("output")
-                .short("o")
-                .long("output")
-                .value_name("FILE")
-                .help("Output file to save the sketch index (.bin).")
-                .required(true)
-                .takes_value(true))
+            .arg(Arg::with_name("input_fof").long("input-fof").value_name("FILE").help("Input dataset: a file of FASTA/Q file paths.").takes_value(true))
+            .arg(Arg::with_name("input_by_line").long("input-by-line").value_name("FILE").help("Input dataset: a file where each line is a sequence.").takes_value(true))
+            .group(ArgGroup::with_name("input_mode").args(&["input_fof", "input_by_line"]).required(true))
+            .arg(Arg::with_name("output").short("o").long("output").value_name("FILE").help("Output file to save the sketch index (.bin).").required(true).takes_value(true))
+            .arg(Arg::with_name("no_compress").long("no-compress").help("Skips sorting and compressing the index; faster build, larger index."))
             .arg(Arg::with_name("k").short("k").long("k_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
@@ -111,19 +97,16 @@ fn main() {
             .arg(Arg::with_name("ref_fof").long("ref-fof").value_name("FILE").takes_value(true))
             .arg(Arg::with_name("ref_by_line").long("ref-by-line").value_name("FILE").takes_value(true))
             .arg(Arg::with_name("ref_sketch").long("ref-sketch").value_name("FILE").takes_value(true))
-            .group(ArgGroup::with_name("reference")
-                .args(&["ref_fof", "ref_by_line", "ref_sketch"])
-                .required(true))
+            .group(ArgGroup::with_name("reference").args(&["ref_fof", "ref_by_line", "ref_sketch"]).required(true))
             .arg(Arg::with_name("query_fof").long("query-fof").value_name("FILE").takes_value(true))
             .arg(Arg::with_name("query_by_line").long("query-by-line").value_name("FILE").takes_value(true))
             .arg(Arg::with_name("query_sketch").long("query-sketch").value_name("FILE").takes_value(true))
-            .group(ArgGroup::with_name("query")
-                .args(&["query_fof", "query_by_line", "query_sketch"])
-                .required(true))
+            .group(ArgGroup::with_name("query").args(&["query_fof", "query_by_line", "query_sketch"]).required(true))
             .arg(Arg::with_name("output").short("o").long("output").value_name("FILE").default_value("output.txt").takes_value(true))
             .arg(Arg::with_name("threshold").long("threshold").value_name("FLOAT").default_value("0.0").takes_value(true))
             .arg(Arg::with_name("matrix").long("matrix"))
             .arg(Arg::with_name("print_stats").long("print-stats"))
+            .arg(Arg::with_name("no_compress").long("no-compress").help("For on-the-fly sketching, skips sorting and compression."))
             .arg(Arg::with_name("k").short("k").long("k_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
@@ -144,9 +127,10 @@ fn main() {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(1);
+        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(4);
         let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
         let output_file = matches.value_of("output").unwrap();
+        let compress = !matches.is_present("no_compress");
         
         let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
             let estimated_e = estimate_genome_size(matches);
@@ -168,7 +152,7 @@ fn main() {
             builder.index_file_line_by_line(line_file);
         }
         
-        let index = builder.into_final_index();
+        let index = builder.into_final_index(compress);
         println!("Sketching took {} seconds.", start_time.elapsed().as_secs());
         
         println!("Dumping sketch index to file: {}", output_file);
@@ -185,11 +169,12 @@ fn main() {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(1);
+        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(4);
         let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
         let output_file = matches.value_of("output").unwrap();
         let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
         let is_matrix = matches.is_present("matrix");
+        let compress = !matches.is_present("no_compress");
 
         let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
             let estimated_e = estimate_genome_size(matches);
@@ -201,37 +186,35 @@ fn main() {
 
         rayon::ThreadPoolBuilder::new().num_threads(threads as usize).build_global().unwrap();
         
-        // --- Process Reference Input ---
         let ref_index = if let Some(sketch_file) = matches.value_of("ref_sketch") {
             Index::from_file(sketch_file).expect("Failed to load reference sketch file")
         } else {
             println!("--- Building Reference Index On-the-fly ---");
-            let start_ref_indexing = Instant::now();
-            let ref_builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
+            let start = Instant::now();
+            let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
             if let Some(fof) = matches.value_of("ref_fof") {
-                ref_builder.index_file_of_files(fof);
+                builder.index_file_of_files(fof);
             } else if let Some(line_file) = matches.value_of("ref_by_line") {
-                ref_builder.index_file_line_by_line(line_file);
+                builder.index_file_line_by_line(line_file);
             }
-            let index = ref_builder.into_final_index();
-            println!("Reference indexing took {} seconds.", start_ref_indexing.elapsed().as_secs());
+            let index = builder.into_final_index(compress);
+            println!("Reference indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
 
-        // --- Process Query Input ---
         let query_index = if let Some(sketch_file) = matches.value_of("query_sketch") {
             Index::from_file(sketch_file).expect("Failed to load query sketch file")
         } else {
             println!("\n--- Building Query Index On-the-fly ---");
-            let start_query_indexing = Instant::now();
-            let query_builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
+            let start = Instant::now();
+            let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor, 1024);
             if let Some(fof) = matches.value_of("query_fof") {
-                query_builder.index_file_of_files(fof);
+                builder.index_file_of_files(fof);
             } else if let Some(line_file) = matches.value_of("query_by_line") {
-                query_builder.index_file_line_by_line(line_file);
+                builder.index_file_line_by_line(line_file);
             }
-            let index = query_builder.into_final_index();
-            println!("Query indexing took {} seconds.", start_query_indexing.elapsed().as_secs());
+            let index = builder.into_final_index(compress);
+            println!("Query indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
         
@@ -242,7 +225,6 @@ fn main() {
             query_index.print_stats();
         }
         
-        // --- Perform Comparison ---
         ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file);
     }
 }
