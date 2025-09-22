@@ -69,8 +69,8 @@ pub struct IndexBuilder {
     mi: u64,
     b: u32, // Sub-division factor
     b_mask: u32,
-    // In-memory buckets to store (final_index, encoded_gid) pairs
-    buckets: Vec<Mutex<Vec<(u64, u32)>>>,
+    // Direct, thread-safe version of the final index structure.
+    intermediate_data: Vec<Mutex<Vec<u32>>>,
     genome_numbers: AtomicU64,
     empty_sketches_count: AtomicU64,
     sketch_mode: SketchMode,
@@ -94,9 +94,6 @@ pub(crate) fn open_compressed_file(path: &str) -> io::Result<Box<dyn BufRead + S
 
 impl IndexBuilder {
     /// Creates a new IndexBuilder for in-memory construction.
-    ///
-    /// # Arguments
-    /// * `num_buckets` - The number of in-memory buckets to use for distributing write load.
     pub fn new(
         ils: u32,
         ik: u32,
@@ -104,32 +101,16 @@ impl IndexBuilder {
         ie: u32,
         mode: SketchMode,
         sub_div_factor: u32,
-        num_buckets: usize,
     ) -> Self {
-        match rlimit::getrlimit(rlimit::Resource::NOFILE) {
-            Ok((soft, hard)) => {
-                if soft < hard {
-                    if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard, hard) {
-                        eprintln!(
-                            "Warning: Failed to raise file descriptor limit: {}.",
-                            e
-                        );
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Could not get the current file descriptor limit: {}.",
-                    e
-                );
-            }
-        }
-
         let s = 1u64 << ils;
         let fingerprint_range = 1u64 << iw;
-
-        // Create a pool of in-memory buckets.
-        let buckets = (0..num_buckets).map(|_| Mutex::new(Vec::new())).collect();
+        
+        let total_size = ((fingerprint_range * s) >> sub_div_factor) as usize;
+        
+        println!("Allocating in-memory index structure...");
+        let intermediate_data = (0..total_size)
+            .map(|_| Mutex::new(Vec::new()))
+            .collect();
 
         Self {
             ls: ils,
@@ -142,47 +123,35 @@ impl IndexBuilder {
             mi: u64::MAX,
             b: sub_div_factor,
             b_mask: (1u32 << sub_div_factor) - 1,
-            buckets,
+            intermediate_data,
             genome_numbers: AtomicU64::new(0),
             empty_sketches_count: AtomicU64::new(0),
             sketch_mode: mode,
         }
     }
 
-    /// Finalizes the index construction from in-memory buckets.
+    /// Finalizes the index construction.
     /// # Arguments
     /// * `compress` - If true, GID lists will be sorted, delta-encoded, and compressed.
-    ///   If false, they will be stored raw, which is faster but uses more memory.
     pub fn into_final_index(self, compress: bool) -> Index {
-        let total_size = ((self.fingerprint_range * self.s) >> self.b) as usize;
-        let mut intermediate_data: Vec<Vec<u32>> = vec![Vec::new(); total_size];
-
-        println!("Aggregating data from in-memory buckets...");
-        for bucket in self.buckets.iter() {
-            let bucket_guard = bucket.lock().unwrap();
-            for &(new_index, encoded_gid) in bucket_guard.iter() {
-                if (new_index as usize) < intermediate_data.len() {
-                    intermediate_data[new_index as usize].push(encoded_gid);
-                }
-            }
-        }
-
         let data: Vec<(u32, Vec<u8>)> = if compress {
             println!("Sorting, delta-encoding, and compressing GID lists...");
-            intermediate_data
+            self.intermediate_data
                 .into_par_iter()
-                .map(|mut gids| {
-                    if gids.is_empty() {
-                        return (0, Vec::new());
-                    }
+                .map(|mutex| {
+                    let mut gids = mutex.into_inner().unwrap();
+                    if gids.is_empty() { return (0, Vec::new()); }
+                    
                     gids.sort_unstable();
                     let original_count = gids.len() as u32;
+
                     let mut prev = gids[0];
                     for i in 1..gids.len() {
                         let current = gids[i];
                         gids[i] = current.wrapping_sub(prev);
                         prev = current;
                     }
+
                     let mut encoded_data = vec![0; 5 * gids.len()];
                     let encoded_len =
                         stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
@@ -192,12 +161,12 @@ impl IndexBuilder {
                 .collect()
         } else {
             println!("Storing raw, unsorted GID lists...");
-            intermediate_data
+            self.intermediate_data
                 .into_par_iter()
-                .map(|gids| {
-                    if gids.is_empty() {
-                        return (0, Vec::new());
-                    }
+                .map(|mutex| {
+                    let gids = mutex.into_inner().unwrap();
+                    if gids.is_empty() { return (0, Vec::new()); }
+
                     let original_count = gids.len() as u32;
                     let mut gids_as_bytes = Vec::with_capacity(gids.len() * 4);
                     for gid in gids {
@@ -242,10 +211,23 @@ impl IndexBuilder {
             let seq_id = i as u32;
             let mut sketch = vec![self.mi; self.s as usize];
             self.compute_sketch(SketchInput::Sequence(line.as_bytes()), &mut sketch);
-            if !sketch.iter().all(|&x| x == self.mi) {
-                self.insert_sketch(&sketch, seq_id);
-            } else {
+
+            if sketch.iter().all(|&x| x == self.mi) {
                 self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            for (i, &fp) in sketch.iter().enumerate() {
+                if fp < self.fingerprint_range {
+                    let flat_index = (fp * self.sketch_size) + i as u64;
+                    let new_index = (flat_index >> self.b) as usize;
+                    let offset = (flat_index as u32) & self.b_mask;
+
+                    if seq_id < (1 << (32 - self.b)) {
+                        let encoded_gid = (seq_id << self.b) | offset;
+                        self.intermediate_data[new_index].lock().unwrap().push(encoded_gid);
+                    }
+                }
             }
         });
     }
@@ -264,10 +246,23 @@ impl IndexBuilder {
                 let seq_id = i as u32;
                 let mut sketch = vec![self.mi; self.s as usize];
                 self.compute_sketch(SketchInput::FilePath(&filepath), &mut sketch);
-                if !sketch.iter().all(|&x| x == self.mi) {
-                    self.insert_sketch(&sketch, seq_id);
-                } else {
+                
+                if sketch.iter().all(|&x| x == self.mi) {
                     self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+
+                for (i, &fp) in sketch.iter().enumerate() {
+                    if fp < self.fingerprint_range {
+                        let flat_index = (fp * self.sketch_size) + i as u64;
+                        let new_index = (flat_index >> self.b) as usize;
+                        let offset = (flat_index as u32) & self.b_mask;
+    
+                        if seq_id < (1 << (32 - self.b)) {
+                            let encoded_gid = (seq_id << self.b) | offset;
+                            self.intermediate_data[new_index].lock().unwrap().push(encoded_gid);
+                        }
+                    }
                 }
             });
     }
@@ -322,25 +317,6 @@ impl IndexBuilder {
                         SketchMode::Default => *val & (self.fingerprint_range - 1),
                         SketchMode::Perfect => self.get_perfect_fingerprint(*val),
                     };
-                }
-            }
-        }
-    }
-
-    fn insert_sketch(&self, sketch: &[u64], genome_id: Gid) {
-        for (i, &fp) in sketch.iter().enumerate() {
-            if fp < self.fingerprint_range {
-                let flat_index = (fp * self.sketch_size) + i as u64;
-                let new_index = (flat_index >> self.b) as usize;
-                let offset = (flat_index as u32) & self.b_mask;
-
-                if genome_id < (1 << (32 - self.b)) {
-                    let encoded_gid = (genome_id << self.b) | offset;
-
-                    // Use a hash of the index to pick an in-memory bucket, to distribute lock contention.
-                    let bucket_index = new_index % self.buckets.len();
-                    let mut bucket_guard = self.buckets[bucket_index].lock().unwrap();
-                    bucket_guard.push((new_index as u64, encoded_gid));
                 }
             }
         }
@@ -504,7 +480,7 @@ impl Index {
         println!("Mean list size: {:.4}", mean);
         println!("Index is compressed: {}", self.is_compressed);
     }
-    /// Performs an all-versus-all comparison between this index (reference) and another (query).
+      /// Performs an all-versus-all comparison between this index (reference) and another (query).
     pub fn all_vs_all_comparison(
         &self,
         query_index: &Index,
