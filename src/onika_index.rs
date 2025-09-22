@@ -1,26 +1,26 @@
 use crate::utils::*;
-use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc, Mutex,
-};
-
+use ahash::AHashMap;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use f128::f128;
 use flate2::read::GzDecoder;
+use io::BufWriter;
 use needletail::parse_fastx_file;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
-use rlimit;
-use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::Path;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc, Mutex,
+};
+use std::thread;
+
+use f128::f128;
 use std::fmt::Write as FmtWrite;
 use stream_vbyte::{decode::decode, scalar::Scalar};
 use zstd::stream::write::Encoder as ZstdEncoder;
-use io::BufWriter;
 
 type Gid = u32;
 
@@ -37,8 +37,16 @@ pub enum SketchInput<'a> {
     FilePath(&'a str),
 }
 
-/// The final, immutable, lock-free index used for querying.
-/// GID lists can be stored in a compressed or raw format.
+/// Represents the source of the index data, either fully in memory or on disk.
+pub enum IndexData {
+    InMemory(Vec<Vec<(u32, Vec<u8>)>>),
+    OnDisk {
+        path: String,
+        toc: Vec<(u64, u64)>, // offset, length
+    },
+}
+
+/// The final, immutable, lock-free index. It contains `s` inverted indexes, one for each sketch position.
 pub struct Index {
     ls: u32,
     w: u32,
@@ -48,10 +56,7 @@ pub struct Index {
     sketch_size: u64,
     fingerprint_range: u64,
     mi: u64,
-    b: u32, // Sub-division factor
-    // Stores (original_gid_count, data_bytes)
-    // data_bytes can be compressed GIDs or raw little-endian u32 GIDs
-    data: Vec<(u32, Vec<u8>)>,
+    data: IndexData,
     genome_numbers: u64,
     sketch_mode: SketchMode,
     is_compressed: bool,
@@ -67,10 +72,7 @@ pub struct IndexBuilder {
     sketch_size: u64,
     fingerprint_range: u64,
     mi: u64,
-    b: u32, // Sub-division factor
-    b_mask: u32,
-    // Direct, thread-safe version of the final index structure.
-    intermediate_data: Vec<Mutex<Vec<u32>>>,
+    intermediate_data: Vec<Vec<Mutex<Vec<u32>>>>,
     genome_numbers: AtomicU64,
     empty_sketches_count: AtomicU64,
     sketch_mode: SketchMode,
@@ -94,22 +96,20 @@ pub(crate) fn open_compressed_file(path: &str) -> io::Result<Box<dyn BufRead + S
 
 impl IndexBuilder {
     /// Creates a new IndexBuilder for in-memory construction.
-    pub fn new(
-        ils: u32,
-        ik: u32,
-        iw: u32,
-        ie: u32,
-        mode: SketchMode,
-        sub_div_factor: u32,
-    ) -> Self {
+    pub fn new(ils: u32, ik: u32, iw: u32, ie: u32, mode: SketchMode) -> Self {
         let s = 1u64 << ils;
         let fingerprint_range = 1u64 << iw;
-        
-        let total_size = ((fingerprint_range * s) >> sub_div_factor) as usize;
-        
-        println!("Allocating in-memory index structure...");
-        let intermediate_data = (0..total_size)
-            .map(|_| Mutex::new(Vec::new()))
+
+        println!(
+            "Allocating in-memory index structure ({} positions x {} fingerprints)...",
+            s, fingerprint_range
+        );
+        let intermediate_data = (0..s)
+            .map(|_| {
+                (0..fingerprint_range)
+                    .map(|_| Mutex::new(Vec::new()))
+                    .collect()
+            })
             .collect();
 
         Self {
@@ -121,8 +121,6 @@ impl IndexBuilder {
             sketch_size: s,
             fingerprint_range,
             mi: u64::MAX,
-            b: sub_div_factor,
-            b_mask: (1u32 << sub_div_factor) - 1,
             intermediate_data,
             genome_numbers: AtomicU64::new(0),
             empty_sketches_count: AtomicU64::new(0),
@@ -131,51 +129,50 @@ impl IndexBuilder {
     }
 
     /// Finalizes the index construction.
-    /// # Arguments
-    /// * `compress` - If true, GID lists will be sorted, delta-encoded, and compressed.
     pub fn into_final_index(self, compress: bool) -> Index {
-        let data: Vec<(u32, Vec<u8>)> = if compress {
-            println!("Sorting, delta-encoding, and compressing GID lists...");
-            self.intermediate_data
-                .into_par_iter()
-                .map(|mutex| {
-                    let mut gids = mutex.into_inner().unwrap();
-                    if gids.is_empty() { return (0, Vec::new()); }
-                    
-                    gids.sort_unstable();
-                    let original_count = gids.len() as u32;
+        let data: Vec<Vec<(u32, Vec<u8>)>> = self
+            .intermediate_data
+            .into_iter()
+            .map(|pos_vec| {
+                if compress {
+                    pos_vec
+                        .into_par_iter()
+                        .map(|mutex| {
+                            let mut gids = mutex.into_inner().unwrap();
+                            if gids.is_empty() { return (0, Vec::new()); }
+                            gids.sort_unstable();
+                            let original_count = gids.len() as u32;
 
-                    let mut prev = gids[0];
-                    for i in 1..gids.len() {
-                        let current = gids[i];
-                        gids[i] = current.wrapping_sub(prev);
-                        prev = current;
-                    }
-
-                    let mut encoded_data = vec![0; 5 * gids.len()];
-                    let encoded_len =
-                        stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
-                    encoded_data.truncate(encoded_len);
-                    (original_count, encoded_data)
-                })
-                .collect()
-        } else {
-            println!("Storing raw, unsorted GID lists...");
-            self.intermediate_data
-                .into_par_iter()
-                .map(|mutex| {
-                    let gids = mutex.into_inner().unwrap();
-                    if gids.is_empty() { return (0, Vec::new()); }
-
-                    let original_count = gids.len() as u32;
-                    let mut gids_as_bytes = Vec::with_capacity(gids.len() * 4);
-                    for gid in gids {
-                        gids_as_bytes.write_u32::<LittleEndian>(gid).unwrap();
-                    }
-                    (original_count, gids_as_bytes)
-                })
-                .collect()
-        };
+                            let mut prev = gids[0];
+                            for i in 1..gids.len() {
+                                let current = gids[i];
+                                gids[i] = current.wrapping_sub(prev);
+                                prev = current;
+                            }
+                            let mut encoded_data = vec![0; 5 * gids.len()];
+                            let encoded_len =
+                                stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
+                            encoded_data.truncate(encoded_len);
+                            (original_count, encoded_data)
+                        })
+                        .collect()
+                } else {
+                    pos_vec
+                        .into_par_iter()
+                        .map(|mutex| {
+                            let gids = mutex.into_inner().unwrap();
+                            if gids.is_empty() { return (0, Vec::new()); }
+                            let original_count = gids.len() as u32;
+                            let mut gids_as_bytes = Vec::with_capacity(gids.len() * 4);
+                            for gid in gids {
+                                gids_as_bytes.write_u32::<LittleEndian>(gid).unwrap();
+                            }
+                            (original_count, gids_as_bytes)
+                        })
+                        .collect()
+                }
+            })
+            .collect();
 
         let empty_count = self.empty_sketches_count.load(Ordering::Relaxed);
         if empty_count > 0 {
@@ -192,8 +189,7 @@ impl IndexBuilder {
             sketch_size: self.sketch_size,
             fingerprint_range: self.fingerprint_range,
             mi: self.mi,
-            b: self.b,
-            data,
+            data: IndexData::InMemory(data),
             genome_numbers: self.genome_numbers.load(Ordering::Relaxed),
             sketch_mode: self.sketch_mode,
             is_compressed: compress,
@@ -201,11 +197,9 @@ impl IndexBuilder {
     }
 
     pub fn index_file_line_by_line(&self, filestr: &str) {
-        let reader = open_compressed_file(filestr)
-            .expect("Could not open file with sequences line by line");
+        let reader = open_compressed_file(filestr).expect("Could not open file with sequences line by line");
         let lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-        self.genome_numbers
-            .store(lines.len() as u64, Ordering::SeqCst);
+        self.genome_numbers.store(lines.len() as u64, Ordering::SeqCst);
 
         lines.into_par_iter().enumerate().for_each(|(i, line)| {
             let seq_id = i as u32;
@@ -217,61 +211,41 @@ impl IndexBuilder {
                 return;
             }
 
-            for (i, &fp) in sketch.iter().enumerate() {
+            for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    let flat_index = (fp * self.sketch_size) + i as u64;
-                    let new_index = (flat_index >> self.b) as usize;
-                    let offset = (flat_index as u32) & self.b_mask;
-
-                    if seq_id < (1 << (32 - self.b)) {
-                        let encoded_gid = (seq_id << self.b) | offset;
-                        self.intermediate_data[new_index].lock().unwrap().push(encoded_gid);
-                    }
+                    self.intermediate_data[pos][fp as usize].lock().unwrap().push(seq_id);
                 }
             }
         });
     }
 
     pub fn index_file_of_files(&self, fof_path: &str) {
-        let reader =
-            open_compressed_file(fof_path).expect("Could not open file of files");
+        let reader = open_compressed_file(fof_path).expect("Could not open file of files");
         let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-        self.genome_numbers
-            .store(files_to_process.len() as u64, Ordering::SeqCst);
+        self.genome_numbers.store(files_to_process.len() as u64, Ordering::SeqCst);
 
-        files_to_process
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(i, filepath)| {
-                let seq_id = i as u32;
-                let mut sketch = vec![self.mi; self.s as usize];
-                self.compute_sketch(SketchInput::FilePath(&filepath), &mut sketch);
-                
-                if sketch.iter().all(|&x| x == self.mi) {
-                    self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
+        files_to_process.into_par_iter().enumerate().for_each(|(i, filepath)| {
+            let seq_id = i as u32;
+            let mut sketch = vec![self.mi; self.s as usize];
+            self.compute_sketch(SketchInput::FilePath(&filepath), &mut sketch);
 
-                for (i, &fp) in sketch.iter().enumerate() {
-                    if fp < self.fingerprint_range {
-                        let flat_index = (fp * self.sketch_size) + i as u64;
-                        let new_index = (flat_index >> self.b) as usize;
-                        let offset = (flat_index as u32) & self.b_mask;
-    
-                        if seq_id < (1 << (32 - self.b)) {
-                            let encoded_gid = (seq_id << self.b) | offset;
-                            self.intermediate_data[new_index].lock().unwrap().push(encoded_gid);
-                        }
-                    }
+            if sketch.iter().all(|&x| x == self.mi) {
+                self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+
+            for (pos, &fp) in sketch.iter().enumerate() {
+                if fp < self.fingerprint_range {
+                    self.intermediate_data[pos][fp as usize].lock().unwrap().push(seq_id);
                 }
-            });
+            }
+        });
     }
 
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
         sketch.fill(self.mi);
         let mut empty_cell = self.s;
-        let is_valid_dna =
-            |c: &u8| matches!(*c, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
+        let is_valid_dna = |c: &u8| matches!(*c, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
 
         let mut update_sketch = |sequence: &[u8]| {
             for subseq in sequence.split(|c| !is_valid_dna(c)) {
@@ -335,17 +309,13 @@ impl IndexBuilder {
                     }
                 }
             }
-            if changes.is_empty() && empty_cell > 0 {
-                break;
-            }
+            if changes.is_empty() && empty_cell > 0 { break; }
 
             for (pos, val) in changes {
                 if sketch[pos] == self.mi {
                     sketch[pos] = val;
                     empty_cell -= 1;
-                    if empty_cell == 0 {
-                        return;
-                    }
+                    if empty_cell == 0 { return; }
                 }
             }
             step += 1;
@@ -353,331 +323,290 @@ impl IndexBuilder {
     }
 
     fn get_perfect_fingerprint(&self, hashed: u64) -> u64 {
-        if hashed == self.mi {
-            return self.mi;
-        }
-
+        if hashed == self.mi { return self.mi; }
         let b = f128::from(hashed >> 32);
         let twopowern = f128::from(1u128 << 32);
         let ratio = f128::from(self.e) / f128::from(self.s);
-
         let top = (twopowern - b).powf(ratio);
         let bottom = twopowern.powf(ratio);
-
         let scaled_top = f128::from(self.fingerprint_range) * top;
         let result_f = f128::from(self.fingerprint_range) - (scaled_top / bottom);
-
-        if result_f < f128::from(0.0) {
-            0
-        } else {
-            result_f.floor().to_u64().unwrap_or(0)
-        }
+        if result_f < f128::from(0.0) { 0 } else { result_f.floor().to_u64().unwrap_or(0) }
     }
 }
 
 impl Index {
     pub fn from_file(filestr: &str) -> io::Result<Self> {
         println!("Loading index from disk: {}...", filestr);
-        let file = File::open(filestr)?;
-        let mut zstd_reader = zstd::stream::read::Decoder::new(file)?;
+        let mut file = BufReader::new(File::open(filestr)?);
 
-        let ls = zstd_reader.read_u32::<LittleEndian>()?;
-        let k = zstd_reader.read_u32::<LittleEndian>()?;
-        let w = zstd_reader.read_u32::<LittleEndian>()?;
-        let e = zstd_reader.read_u32::<LittleEndian>()?;
-        let fingerprint_range = zstd_reader.read_u64::<LittleEndian>()?;
-        let genome_numbers = zstd_reader.read_u64::<LittleEndian>()?;
-        let sketch_mode = match zstd_reader.read_u8()? {
+        let ls = file.read_u32::<LittleEndian>()?;
+        let k = file.read_u32::<LittleEndian>()?;
+        let w = file.read_u32::<LittleEndian>()?;
+        let e = file.read_u32::<LittleEndian>()?;
+        let fingerprint_range = file.read_u64::<LittleEndian>()?;
+        let genome_numbers = file.read_u64::<LittleEndian>()?;
+        let sketch_mode = match file.read_u8()? {
             1 => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let b = zstd_reader.read_u32::<LittleEndian>()?;
-        let is_compressed = zstd_reader.read_u8()? != 0;
-
+        let is_compressed = file.read_u8()? != 0;
         let s = 1u64 << ls;
-        let total_size = ((fingerprint_range * s) >> b) as usize;
-        let mut data = Vec::with_capacity(total_size);
 
-        for _ in 0..total_size {
-            let original_count = zstd_reader.read_u32::<LittleEndian>()?;
-            let gids_len = zstd_reader.read_u32::<LittleEndian>()?;
-            let mut gids_bytes = vec![0u8; gids_len as usize];
-            zstd_reader.read_exact(&mut gids_bytes)?;
-            data.push((original_count, gids_bytes));
+        let mut toc = Vec::with_capacity(s as usize);
+        for _ in 0..s {
+            toc.push((file.read_u64::<LittleEndian>()?, file.read_u64::<LittleEndian>()?));
         }
 
-        println!("Finished loading index.");
+        println!("Finished loading index metadata.");
         Ok(Self {
-            ls,
-            w,
-            k,
-            e,
-            s,
-            sketch_size: s,
-            fingerprint_range,
-            mi: u64::MAX,
-            b,
-            data,
-            genome_numbers,
-            sketch_mode,
-            is_compressed,
+            ls, w, k, e, s, sketch_size: s, fingerprint_range, mi: u64::MAX,
+            data: IndexData::OnDisk { path: filestr.to_string(), toc },
+            genome_numbers, sketch_mode, is_compressed,
         })
     }
 
     pub fn dump_index_disk(&self, filestr: &str, zstd_level: i32) -> io::Result<()> {
-        if !self.is_compressed {
-            eprintln!("Warning: Dumping an uncompressed index is not recommended for portability.");
+        let data = match &self.data {
+            IndexData::InMemory(d) => d,
+            _ => panic!("dump_index_disk can only be called on an in-memory index."),
+        };
+
+        let mut file = BufWriter::new(File::create(filestr)?);
+
+        file.write_u32::<LittleEndian>(self.ls)?;
+        file.write_u32::<LittleEndian>(self.k)?;
+        file.write_u32::<LittleEndian>(self.w)?;
+        file.write_u32::<LittleEndian>(self.e)?;
+        file.write_u64::<LittleEndian>(self.fingerprint_range)?;
+        file.write_u64::<LittleEndian>(self.genome_numbers)?;
+        file.write_u8(self.sketch_mode as u8)?;
+        file.write_u8(self.is_compressed as u8)?;
+
+        let position_buffers: Vec<Vec<u8>> = data.par_iter().map(|pos_index| {
+            let mut uncompressed_buffer = Vec::new();
+            for (original_count, gids_bytes) in pos_index {
+                uncompressed_buffer.write_u32::<LittleEndian>(*original_count).unwrap();
+                uncompressed_buffer.write_u32::<LittleEndian>(gids_bytes.len() as u32).unwrap();
+                uncompressed_buffer.write_all(gids_bytes).unwrap();
+            }
+            zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
+        }).collect();
+        
+        // Reserve space for TOC
+        let toc_size = (self.s * 16) as u64; // 2 * u64 per entry
+        file.seek(SeekFrom::Current(toc_size as i64))?;
+
+        let mut toc = Vec::with_capacity(self.s as usize);
+        let mut current_offset = file.stream_position()?;
+        for compressed_buffer in &position_buffers {
+            let len = compressed_buffer.len() as u64;
+            toc.push((current_offset, len));
+            file.write_all(compressed_buffer)?;
+            current_offset += len;
         }
-        let file = File::create(filestr)?;
-        let mut writer = ZstdEncoder::new(file, zstd_level)?.auto_finish();
 
-        writer.write_u32::<LittleEndian>(self.ls)?;
-        writer.write_u32::<LittleEndian>(self.k)?;
-        writer.write_u32::<LittleEndian>(self.w)?;
-        writer.write_u32::<LittleEndian>(self.e)?;
-        writer.write_u64::<LittleEndian>(self.fingerprint_range)?;
-        writer.write_u64::<LittleEndian>(self.genome_numbers)?;
-        writer.write_u8(self.sketch_mode as u8)?;
-        writer.write_u32::<LittleEndian>(self.b)?;
-        writer.write_u8(self.is_compressed as u8)?;
-
-        for (original_count, gids_bytes) in &self.data {
-            writer.write_u32::<LittleEndian>(*original_count)?;
-            writer.write_u32::<LittleEndian>(gids_bytes.len() as u32)?;
-            writer.write_all(gids_bytes)?;
+        file.seek(SeekFrom::Start(4 + 4 + 4 + 4 + 8 + 8 + 1 + 1))?;
+        for (offset, len) in toc {
+            file.write_u64::<LittleEndian>(offset)?;
+            file.write_u64::<LittleEndian>(len)?;
         }
 
         Ok(())
     }
 
     pub fn print_stats(&self) {
-        println!("\nINDEX STATISTICS");
-        println!("=========================================================");
+        if let IndexData::InMemory(data) = &self.data {
+            println!("\nINDEX STATISTICS (In-Memory)");
+            println!("=========================================================");
 
-        let sizes: Vec<u64> = self
-            .data
-            .par_iter()
-            .map(|(count, _)| *count as u64)
-            .filter(|&size| size > 0)
-            .collect();
+            let sizes: Vec<u64> = data
+                .par_iter()
+                .flat_map(|pos_index| pos_index.par_iter().map(|(count, _)| *count as u64))
+                .filter(|&size| size > 0)
+                .collect();
 
-        if sizes.is_empty() {
-            println!("Index is empty. No stats to compute.");
-            return;
+            if sizes.is_empty() { println!("Index is empty."); return; }
+            let num_lists = sizes.len() as f64;
+            let sum: u64 = sizes.iter().sum();
+            let mean = sum as f64 / num_lists;
+            let min_size = *sizes.iter().min().unwrap_or(&0);
+            let max_size = *sizes.iter().max().unwrap_or(&0);
+
+            println!("Number of non-empty lists: {}", sizes.len());
+            println!("Total elements in index: {}", sum);
+            println!("Min list size: {}", min_size);
+            println!("Max list size: {}", max_size);
+            println!("Mean list size: {:.4}", mean);
+            println!("Index is compressed: {}", self.is_compressed);
+        } else {
+            println!("\nINDEX STATISTICS (On-Disk)");
+            println!("=========================================================");
+            println!("Statistics are not computed for on-disk indexes to avoid slow file reads.");
+            println!("Sketch Size (s): {}", self.sketch_size);
+            println!("Fingerprint Range (2^w): {}", self.fingerprint_range);
+            println!("Number of Genomes: {}", self.genome_numbers);
         }
-
-        let num_lists = sizes.len() as f64;
-        let sum: u64 = sizes.iter().sum();
-        let mean = sum as f64 / num_lists;
-
-        let min_size = *sizes.iter().min().unwrap_or(&0);
-        let max_size = *sizes.iter().max().unwrap_or(&0);
-
-        println!("Number of non-empty lists: {}", sizes.len());
-        println!("Total elements in index: {}", sum);
-        println!("Min list size: {}", min_size);
-        println!("Max list size: {}", max_size);
-        println!("Mean list size: {:.4}", mean);
-        println!("Index is compressed: {}", self.is_compressed);
     }
-      /// Performs an all-versus-all comparison between this index (reference) and another (query).
-    pub fn all_vs_all_comparison(
-        &self,
-        query_index: &Index,
-        threshold: f64,
-        is_matrix: bool,
-        zstd_level: i32,
-        output_file: &str,
-    ) {
+
+    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str) {
         println!("\n--- Starting All-Versus-All Comparison ---");
         let start_time = std::time::Instant::now();
 
         let num_queries = query_index.genome_numbers as usize;
         let num_refs = self.genome_numbers as usize;
 
-        if self.data.len() != query_index.data.len() {
-            panic!("Incompatible indices for comparison: different total sizes.");
-        }
+        let min_required_score = if threshold > 0.0 { (threshold * self.s as f64).ceil() as u32 } else { 0 };
+        let perform_pruning = min_required_score > 1;
+        if perform_pruning { println!("Similarity threshold of {} requires at least {} shared fingerprints. Applying pruning.", threshold, min_required_score); }
+
+        let num_shards = 1024;
+        let scores_shards: Vec<Mutex<AHashMap<(u32, u32), u32>>> =
+            (0..num_shards).map(|_| Mutex::new(AHashMap::default())).collect();
+
+        let (tx, rx) = mpsc::sync_channel(2); 
+
+        let ref_path = self.path_for_reading().to_string();
+        let query_path = query_index.path_for_reading().to_string();
+        let ref_toc = self.toc_for_reading().to_vec();
+        let query_toc = query_index.toc_for_reading().to_vec();
+        let s = self.s;
+        let fp_range = self.fingerprint_range;
         
-        // OPTIMIZATION: Use a sharded HashMap to avoid the reduce bottleneck.
-        // The number of shards is equal to the number of threads Rayon will use.
-        let num_shards = rayon::current_num_threads();
-        let scores_shards: Vec<Mutex<HashMap<(u32, u32), u32>>> =
-            (0..num_shards).map(|_| Mutex::new(HashMap::new())).collect();
+        let producer_handle = thread::spawn(move || {
+            let mut ref_file = File::open(ref_path).expect("Cannot open reference index file in producer.");
+            let mut query_file = File::open(query_path).expect("Cannot open query index file in producer.");
+            for pos in 0..s as usize {
+                let ref_pos_data = read_pos_from_file(&mut ref_file, &ref_toc, pos, fp_range);
+                let query_pos_data = read_pos_from_file(&mut query_file, &query_toc, pos, fp_range);
+                if tx.send((pos, ref_pos_data, query_pos_data)).is_err() { break; }
+            }
+        });
 
-        (0..self.data.len()).into_par_iter().for_each(|flat_index| {
-            let (ref_count, ref_bytes) = &self.data[flat_index];
-            if *ref_count > 0 {
-                let (query_count, query_bytes) = &query_index.data[flat_index];
-                if *query_count > 0 {
-                    let ref_gids_encoded =
-                        decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
-                    let query_gids_encoded =
-                        decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
+        for (pos, ref_pos_index, query_pos_index) in rx {
+            let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
+            (0..self.fingerprint_range as usize).into_par_iter().for_each(|fp| {
+                let (ref_count, ref_bytes) = &ref_pos_index[fp];
+                if *ref_count > 0 {
+                    let (query_count, query_bytes) = &query_pos_index[fp];
+                    if *query_count > 0 {
+                        let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
+                        let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
 
-                    let b_mask = (1u32 << self.b) - 1;
-                    let b_shift = self.b;
+                        for &query_gid in &query_gids {
+                            for &ref_gid in &ref_gids {
+                                let key = (query_gid, ref_gid);
+                                let shard_index = key.0 as usize % num_shards;
+                                let mut shard = scores_shards[shard_index].lock().unwrap();
 
-                    let mut ref_pairs: Vec<(u32, u32)> = ref_gids_encoded
-                        .iter()
-                        .map(|&gid| (gid & b_mask, gid >> b_shift))
-                        .collect();
-                    ref_pairs.sort_unstable();
-
-                    let mut query_pairs: Vec<(u32, u32)> = query_gids_encoded
-                        .iter()
-                        .map(|&gid| (gid & b_mask, gid >> b_shift))
-                        .collect();
-                    query_pairs.sort_unstable();
-
-                    let mut i = 0;
-                    let mut j = 0;
-                    while i < ref_pairs.len() && j < query_pairs.len() {
-                        let ref_offset = ref_pairs[i].0;
-                        let query_offset = query_pairs[j].0;
-
-                        if ref_offset < query_offset {
-                            i += 1;
-                        } else if query_offset < ref_offset {
-                            j += 1;
-                        } else {
-                            let mut i_end = i;
-                            while i_end < ref_pairs.len() && ref_pairs[i_end].0 == ref_offset {
-                                i_end += 1;
-                            }
-
-                            let mut j_end = j;
-                            while j_end < query_pairs.len() && query_pairs[j_end].0 == query_offset {
-                                j_end += 1;
-                            }
-
-                            for query_idx in j..j_end {
-                                for ref_idx in i..i_end {
-                                    let query_gid = query_pairs[query_idx].1;
-                                    let ref_gid = ref_pairs[ref_idx].1;
-                                    
-                                    // Hash the pair to determine which shard to lock
-                                    let key = (query_gid, ref_gid);
-                                    let shard_index = key.0 as usize % num_shards;
-                                    let mut shard = scores_shards[shard_index].lock().unwrap();
+                                if !perform_pruning {
                                     *shard.entry(key).or_insert(0) += 1;
+                                } else if let Some(score) = shard.get_mut(&key) {
+                                    *score += 1;
+                                    if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
+                                } else if 1 + remaining_hits_possible >= min_required_score as u64 {
+                                    shard.insert(key, 1);
                                 }
                             }
-
-                            i = i_end;
-                            j = j_end;
                         }
                     }
                 }
-            }
-        });
+            });
+        }
+        producer_handle.join().unwrap();
         
-        println!(
-            "Score calculation finished in {} seconds. Aggregating and formatting results...",
-            start_time.elapsed().as_secs()
-        );
+        println!("Score calculation finished in {} seconds. Aggregating and formatting results...", start_time.elapsed().as_secs());
 
         let mut scores_by_query: Vec<Vec<(Gid, u32)>> = vec![Vec::new(); num_queries];
         for shard_mutex in scores_shards {
             let shard_map = shard_mutex.into_inner().unwrap();
             for ((query_gid, ref_gid), count) in shard_map {
-                if (query_gid as usize) < num_queries {
+                if count >= min_required_score && (query_gid as usize) < num_queries {
                     scores_by_query[query_gid as usize].push((ref_gid, count));
                 }
             }
         }
         
         println!("Parallel formatting of results...");
-        let output_lines: Vec<String> = (0..num_queries)
-            .into_par_iter()
-            .map(|query_gid| {
-                let mut line = String::with_capacity(256); // Pre-allocate string
-                write!(&mut line, "query_{}\t", query_gid).unwrap();
-                
-                let res = &scores_by_query[query_gid];
-
-                if is_matrix {
-                    let mut full_row = vec![0.0; num_refs];
-                    for &(ref_gid, count) in res {
-                        if (ref_gid as usize) < num_refs {
-                            full_row[ref_gid as usize] = count as f64 / self.s as f64;
-                        }
-                    }
-                    let similarities: Vec<String> = full_row
-                        .iter()
-                        .map(|&similarity| {
-                            if similarity >= threshold {
-                                format!("{:.4}", similarity)
-                            } else {
-                                "0.0000".to_string()
-                            }
-                        })
-                        .collect();
-                    line.push_str(&similarities.join(","));
-                } else { // Sparse format
-                    let mut hits: Vec<(Gid, f64)> = res
-                        .iter()
-                        .map(|&(ref_gid, count)| (ref_gid, count as f64 / self.s as f64))
-                        .filter(|&(_, sim)| sim >= threshold)
-                        .collect();
-
-                    hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                    line.push_str(
-                        &hits
-                            .iter()
-                            .map(|(gid, sim)| format!("{}:{:.4}", gid, sim))
-                            .collect::<Vec<String>>()
-                            .join(","),
-                    );
+        let output_lines: Vec<String> = (0..num_queries).into_par_iter().map(|query_gid| {
+            let mut line = String::with_capacity(256);
+            write!(&mut line, "query_{}\t", query_gid).unwrap();
+            let mut res = scores_by_query[query_gid].clone();
+            if is_matrix {
+                let mut full_row = vec![0.0; num_refs];
+                for &(ref_gid, count) in res.iter() {
+                    if (ref_gid as usize) < num_refs { full_row[ref_gid as usize] = count as f64 / self.s as f64; }
                 }
-                line
-            })
-            .collect();
+                line.push_str(&full_row.iter().map(|&sim| if sim >= threshold { format!("{:.4}", sim) } else { "0.0000".to_string() }).collect::<Vec<String>>().join(","));
+            } else {
+                res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                line.push_str(&res.iter().map(|(gid, count)| format!("{}:{:.4}", gid, *count as f64 / self.s as f64)).collect::<Vec<String>>().join(","));
+            }
+            line
+        }).collect();
         
         println!("Writing results to disk...");
         let mut writer = self.create_writer(output_file, zstd_level);
-        for line in output_lines {
-            writeln!(writer, "{}", line).unwrap();
-        }
+        for line in output_lines { writeln!(writer, "{}", line).unwrap(); }
 
-        println!(
-            "All-vs-all comparison complete. Total time: {} seconds.",
-            start_time.elapsed().as_secs()
-        );
+        println!("All-vs-all comparison complete. Total time: {} seconds.", start_time.elapsed().as_secs());
     }
-
 
     fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
         let file = File::create(output_file).expect("Cannot create output file");
-        if zstd_level > 0 {
-            Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish())
-        } else {
-            Box::new(BufWriter::new(file))
+        if zstd_level > 0 { Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish()) } else { Box::new(BufWriter::new(file)) }
+    }
+
+    fn path_for_reading(&self) -> &str {
+        match &self.data {
+            IndexData::OnDisk { path, .. } => path,
+            IndexData::InMemory(_) => panic!("Cannot get file path for an in-memory index."),
+        }
+    }
+    
+    fn toc_for_reading(&self) -> &[(u64, u64)] {
+        match &self.data {
+            IndexData::OnDisk { toc, .. } => toc,
+            IndexData::InMemory(_) => panic!("Cannot get TOC for an in-memory index."),
         }
     }
 }
 
+fn read_pos_from_file(file: &mut File, toc: &[(u64, u64)], pos: usize, fp_range: u64) -> Vec<(u32, Vec<u8>)> {
+    let (offset, len) = toc[pos];
+    if len == 0 { return Vec::new(); }
+    
+    let mut compressed_buffer = vec![0; len as usize];
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.read_exact(&mut compressed_buffer).unwrap();
+    
+    let buffer = zstd::decode_all(&compressed_buffer[..]).unwrap();
+    
+    let mut cursor = io::Cursor::new(&buffer);
+    let mut pos_index = Vec::with_capacity(fp_range as usize);
+
+    while (cursor.position() as usize) < buffer.len() {
+        let original_count = cursor.read_u32::<LittleEndian>().unwrap();
+        let gids_len = cursor.read_u32::<LittleEndian>().unwrap();
+        let mut gids_bytes = vec![0u8; gids_len as usize];
+        cursor.read_exact(&mut gids_bytes).unwrap();
+        pos_index.push((original_count, gids_bytes));
+    }
+    pos_index
+}
 
 /// Helper to decode a GID list from bytes depending on whether it's compressed.
 fn decode_gid_list(count: u32, bytes: &[u8], is_compressed: bool) -> Vec<u32> {
-    if count == 0 {
-        return Vec::new();
-    }
-
+    if count == 0 { return Vec::new(); }
     if is_compressed {
-        let mut gids = vec![0u32; count as usize]; // Pre-allocate with length for the decoder
+        let mut gids = vec![0u32; count as usize];
         decode::<Scalar>(bytes, count as usize, &mut gids);
-        for j in 1..gids.len() {
-            gids[j] = gids[j].wrapping_add(gids[j - 1]);
-        }
+        for j in 1..gids.len() { gids[j] = gids[j].wrapping_add(gids[j - 1]); }
         gids
     } else {
-        let mut gids = Vec::with_capacity(count as usize); // Allocate capacity and push
+        let mut gids = Vec::with_capacity(count as usize);
         let mut cursor = io::Cursor::new(bytes);
-        for _ in 0..count {
-            gids.push(cursor.read_u32::<LittleEndian>().unwrap());
-        }
+        for _ in 0..count { gids.push(cursor.read_u32::<LittleEndian>().unwrap()); }
         gids
     }
 }

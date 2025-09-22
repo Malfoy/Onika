@@ -14,7 +14,7 @@ mod utils;
 use clap::{App, SubCommand, Arg, ArgGroup, ArgMatches};
 use onika_index::{Index, IndexBuilder, SketchMode, open_compressed_file};
 use std::time::Instant;
-use std::io::{BufReader, BufRead};
+use std::io::{ BufRead};
 
 /// Estimates the average document size by sampling the first 100 documents or sequences.
 fn estimate_genome_size(matches: &ArgMatches) -> u32 {
@@ -89,7 +89,6 @@ fn main() {
             .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
-            .arg(Arg::with_name("sub_div_factor").long("sub-div-factor").value_name("B").default_value("4").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
         )
         .subcommand(SubCommand::with_name("compare")
@@ -113,7 +112,6 @@ fn main() {
             .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
-            .arg(Arg::with_name("sub_div_factor").long("sub-div-factor").value_name("B").default_value("4").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
         )
         .get_matches();
@@ -127,7 +125,6 @@ fn main() {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(4);
         let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
         let output_file = matches.value_of("output").unwrap();
         let compress = !matches.is_present("no_compress");
@@ -144,7 +141,7 @@ fn main() {
         
         println!("--- Building Sketch Index ---");
         let start_time = Instant::now();
-        let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor);
+        let builder = IndexBuilder::new(s, k, w, e, sketch_mode);
 
         if let Some(fof) = matches.value_of("input_fof") {
             builder.index_file_of_files(fof);
@@ -169,7 +166,6 @@ fn main() {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let sub_div_factor = value_t!(matches, "sub_div_factor", u32).unwrap_or(4);
         let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
         let output_file = matches.value_of("output").unwrap();
         let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
@@ -191,7 +187,7 @@ fn main() {
         } else {
             println!("--- Building Reference Index On-the-fly ---");
             let start = Instant::now();
-            let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor);
+            let builder = IndexBuilder::new(s, k, w, e, sketch_mode);
             if let Some(fof) = matches.value_of("ref_fof") {
                 builder.index_file_of_files(fof);
             } else if let Some(line_file) = matches.value_of("ref_by_line") {
@@ -207,7 +203,7 @@ fn main() {
         } else {
             println!("\n--- Building Query Index On-the-fly ---");
             let start = Instant::now();
-            let builder = IndexBuilder::new(s, k, w, e, sketch_mode, sub_div_factor);
+            let builder = IndexBuilder::new(s, k, w, e, sketch_mode);
             if let Some(fof) = matches.value_of("query_fof") {
                 builder.index_file_of_files(fof);
             } else if let Some(line_file) = matches.value_of("query_by_line") {
