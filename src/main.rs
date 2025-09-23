@@ -221,6 +221,6 @@ fn main() {
             query_index.print_stats();
         }
         
-        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file);
+        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file,32,16);
     }
 }
