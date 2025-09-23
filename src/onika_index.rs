@@ -3,6 +3,7 @@ use ahash::AHashMap;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flate2::read::GzDecoder;
 use io::BufWriter;
+use needletail::parse_fastx_reader;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
@@ -11,16 +12,15 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::sync::atomic::AtomicU64;
-
 use std::thread;
 
 use f128::f128;
 use std::fmt::Write as FmtWrite;
 use stream_vbyte::{decode::decode, scalar::Scalar};
+use tempfile::NamedTempFile;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 type Gid = u32;
@@ -42,6 +42,8 @@ pub enum SketchInput<'a> {
 pub enum IndexData {
     InMemory(Vec<Vec<(u32, Vec<u8>)>>),
     OnDisk {
+        // Option is used to hold the NamedTempFile guard until it's persisted.
+        handle: Option<Arc<NamedTempFile>>,
         path: String,
         toc: Vec<(u64, u64)>, // offset, length
     },
@@ -73,7 +75,9 @@ pub struct IndexBuilder {
     sketch_size: u64,
     fingerprint_range: u64,
     mi: u64,
-    intermediate_data: Vec<Vec<Mutex<Vec<u32>>>>,
+    // A vector of lists. Each list corresponds to a sketch position
+    // and stores (doc_id, fingerprint) pairs.
+    intermediate_data: Vec<Mutex<Vec<(u32, u64)>>>,
     genome_numbers: AtomicU64,
     empty_sketches_count: AtomicU64,
     sketch_mode: SketchMode,
@@ -102,15 +106,10 @@ impl IndexBuilder {
         let fingerprint_range = 1u64 << iw;
 
         println!(
-            "Allocating in-memory index structure ({} positions x {} fingerprints)...",
-            s, fingerprint_range
+            "Allocating {} lists for sketch positions...", s
         );
         let intermediate_data = (0..s)
-            .map(|_| {
-                (0..fingerprint_range)
-                    .map(|_| Mutex::new(Vec::new()))
-                    .collect()
-            })
+            .map(|_| Mutex::new(Vec::new()))
             .collect();
 
         Self {
@@ -129,59 +128,94 @@ impl IndexBuilder {
         }
     }
 
-    /// Finalizes the index construction.
-    pub fn into_final_index(self, compress: bool) -> Index {
-        let data: Vec<Vec<(u32, Vec<u8>)>> = self
-            .intermediate_data
-            .into_iter()
-            .map(|pos_vec| {
-                if compress {
-                    pos_vec
-                        .into_par_iter()
-                        .map(|mutex| {
-                            let mut gids = mutex.into_inner().unwrap();
-                            if gids.is_empty() { return (0, Vec::new()); }
-                            gids.sort_unstable();
-                            let original_count = gids.len() as u32;
-
-                            let mut prev = gids[0];
-                            for i in 1..gids.len() {
-                                let current = gids[i];
-                                gids[i] = current.wrapping_sub(prev);
-                                prev = current;
-                            }
-                            let mut encoded_data = vec![0; 5 * gids.len()];
-                            let encoded_len =
-                                stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
-                            encoded_data.truncate(encoded_len);
-                            (original_count, encoded_data)
-                        })
-                        .collect()
+    /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
+    pub fn into_final_index(self, compress: bool, zstd_level: i32) -> io::Result<Index> {
+        println!("Building inverted indexes and streaming to temporary file (in parallel)...");
+        
+        let temp_file = NamedTempFile::new()?;
+        let path_str = temp_file.path().to_str().unwrap().to_string();
+        
+        let position_buffers: Vec<Vec<u8>> = self.intermediate_data.into_par_iter().map(|pos_mutex| {
+            let pos_pairs = pos_mutex.into_inner().unwrap();
+            let mut inverted_index: Vec<Vec<u32>> = vec![Vec::new(); self.fingerprint_range as usize];
+            for (doc_id, fp) in pos_pairs {
+                inverted_index[fp as usize].push(doc_id);
+            }
+            
+            let mut uncompressed_buffer = Vec::new();
+            for mut gids in inverted_index {
+                let original_count = gids.len() as u32;
+                let gids_bytes = if compress && !gids.is_empty() {
+                    gids.sort_unstable();
+                    let mut prev = gids[0];
+                    for i in 1..gids.len() {
+                        let current = gids[i];
+                        gids[i] = current.wrapping_sub(prev);
+                        prev = current;
+                    }
+                    let mut encoded_data = vec![0; 5 * gids.len()];
+                    let encoded_len = stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
+                    encoded_data.truncate(encoded_len);
+                    encoded_data
                 } else {
-                    pos_vec
-                        .into_par_iter()
-                        .map(|mutex| {
-                            let gids = mutex.into_inner().unwrap();
-                            if gids.is_empty() { return (0, Vec::new()); }
-                            let original_count = gids.len() as u32;
-                            let mut gids_as_bytes = Vec::with_capacity(gids.len() * 4);
-                            for gid in gids {
-                                gids_as_bytes.write_u32::<LittleEndian>(gid).unwrap();
-                            }
-                            (original_count, gids_as_bytes)
-                        })
-                        .collect()
-                }
-            })
-            .collect();
+                    let mut bytes = Vec::with_capacity(gids.len() * 4);
+                    for gid in gids {
+                        bytes.write_u32::<LittleEndian>(gid).unwrap();
+                    }
+                    bytes
+                };
+                uncompressed_buffer.write_u32::<LittleEndian>(original_count).unwrap();
+                uncompressed_buffer.write_u32::<LittleEndian>(gids_bytes.len() as u32).unwrap();
+                uncompressed_buffer.write_all(&gids_bytes).unwrap();
+            }
+            zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
+        }).collect();
 
+        let mut toc = Vec::with_capacity(self.s as usize);
+        
+        { // Scope for the BufWriter to ensure it's dropped and flushed before we move temp_file
+            let mut file = BufWriter::new(temp_file.as_file());
+
+            // Write placeholders for header and TOC
+            let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 1 + 1;
+            let toc_size = (self.s * 16) as u64;
+            
+            let mut current_offset = header_size + toc_size;
+            for buffer in &position_buffers {
+                let len = buffer.len() as u64;
+                toc.push((current_offset, len));
+                current_offset += len;
+            }
+
+            file.seek(SeekFrom::Start(0))?;
+            file.write_u32::<LittleEndian>(self.ls)?;
+            file.write_u32::<LittleEndian>(self.k)?;
+            file.write_u32::<LittleEndian>(self.w)?;
+            file.write_u32::<LittleEndian>(self.e)?;
+            file.write_u64::<LittleEndian>(self.fingerprint_range)?;
+            file.write_u64::<LittleEndian>(self.genome_numbers.load(Ordering::Relaxed))?;
+            file.write_u8(self.sketch_mode as u8)?;
+            file.write_u8(compress as u8)?;
+
+            for (offset, len) in &toc {
+                file.write_u64::<LittleEndian>(*offset)?;
+                file.write_u64::<LittleEndian>(*len)?;
+            }
+
+            for buffer in position_buffers {
+                file.write_all(&buffer)?;
+            }
+        } // BufWriter is dropped here
+        
         let empty_count = self.empty_sketches_count.load(Ordering::Relaxed);
         if empty_count > 0 {
             eprintln!("\nWarning: {} input documents resulted in empty sketches and were not indexed.", empty_count);
         }
         println!("Index construction complete.");
 
-        Index {
+        let (file_handle, path) = temp_file.into_parts();
+        
+        Ok(Index {
             ls: self.ls,
             w: self.w,
             k: self.k,
@@ -190,11 +224,11 @@ impl IndexBuilder {
             sketch_size: self.sketch_size,
             fingerprint_range: self.fingerprint_range,
             mi: self.mi,
-            data: IndexData::InMemory(data),
+            data: IndexData::OnDisk { handle: Some(Arc::new(NamedTempFile::from_parts(file_handle, path))), path: path_str, toc },
             genome_numbers: self.genome_numbers.load(Ordering::Relaxed),
             sketch_mode: self.sketch_mode,
             is_compressed: compress,
-        }
+        })
     }
 
     pub fn index_fasta_file(&self, filestr: &str) {
@@ -222,10 +256,7 @@ impl IndexBuilder {
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos][fp as usize]
-                        .lock()
-                        .unwrap()
-                        .push(seq_id);
+                    self.intermediate_data[pos].lock().unwrap().push((seq_id, fp));
                 }
             }
         });
@@ -248,7 +279,7 @@ impl IndexBuilder {
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos][fp as usize].lock().unwrap().push(seq_id);
+                    self.intermediate_data[pos].lock().unwrap().push((seq_id, fp));
                 }
             }
         });
@@ -373,58 +404,30 @@ impl Index {
         println!("Finished loading index metadata.");
         Ok(Self {
             ls, w, k, e, s, sketch_size: s, fingerprint_range, mi: u64::MAX,
-            data: IndexData::OnDisk { path: filestr.to_string(), toc },
+            data: IndexData::OnDisk { handle: None, path: filestr.to_string(), toc },
             genome_numbers, sketch_mode, is_compressed,
         })
     }
 
-    pub fn dump_index_disk(&self, filestr: &str, zstd_level: i32) -> io::Result<()> {
-        let data = match &self.data {
-            IndexData::InMemory(d) => d,
-            _ => panic!("dump_index_disk can only be called on an in-memory index."),
-        };
-
-        let mut file = BufWriter::new(File::create(filestr)?);
-
-        file.write_u32::<LittleEndian>(self.ls)?;
-        file.write_u32::<LittleEndian>(self.k)?;
-        file.write_u32::<LittleEndian>(self.w)?;
-        file.write_u32::<LittleEndian>(self.e)?;
-        file.write_u64::<LittleEndian>(self.fingerprint_range)?;
-        file.write_u64::<LittleEndian>(self.genome_numbers)?;
-        file.write_u8(self.sketch_mode as u8)?;
-        file.write_u8(self.is_compressed as u8)?;
-
-        let position_buffers: Vec<Vec<u8>> = data.par_iter().map(|pos_index| {
-            let mut uncompressed_buffer = Vec::new();
-            for (original_count, gids_bytes) in pos_index {
-                uncompressed_buffer.write_u32::<LittleEndian>(*original_count).unwrap();
-                uncompressed_buffer.write_u32::<LittleEndian>(gids_bytes.len() as u32).unwrap();
-                uncompressed_buffer.write_all(gids_bytes).unwrap();
+    pub fn dump_index_disk(self, filestr: &str) -> io::Result<()> {
+        match self.data {
+            IndexData::OnDisk{ handle, path, ..} => {
+                if let Some(temp_handle) = handle {
+                    // This was a temporary file, persist it to the final destination
+                    match Arc::try_unwrap(temp_handle) {
+                        Ok(temp_file) => { temp_file.persist(filestr)?; },
+                        Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to unwrap Arc for temp file")),
+                    }
+                } else {
+                    // This was already a permanent file, copy it.
+                    std::fs::copy(&path, filestr)?;
+                }
+            },
+            IndexData::InMemory(_) => {
+                // This case should ideally not be hit if builder always creates OnDisk indexes.
+                panic!("dump_index_disk called on an in-memory index, which is not supported by the new design.");
             }
-            zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
-        }).collect();
-        
-        let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 1 + 1;
-        let toc_size = (self.s * 16) as u64;
-        
-        let mut toc = Vec::with_capacity(self.s as usize);
-        let mut current_offset = header_size + toc_size;
-        for buffer in &position_buffers {
-            let len = buffer.len() as u64;
-            toc.push((current_offset, len));
-            current_offset += len;
         }
-        
-        for (offset, len) in &toc {
-            file.write_u64::<LittleEndian>(*offset)?;
-            file.write_u64::<LittleEndian>(*len)?;
-        }
-        
-        for compressed_buffer in position_buffers {
-            file.write_all(&compressed_buffer)?;
-        }
-
         Ok(())
     }
 

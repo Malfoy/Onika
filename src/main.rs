@@ -8,6 +8,7 @@ extern crate num_traits;
 extern crate needletail;
 extern crate byteorder;
 extern crate ahash;
+extern crate tempfile;
 
 
 mod onika_index;
@@ -78,7 +79,6 @@ fn main() {
         .version("1.0")
         .author("Rust Translation")
         .about("A tool for MinHash sketching and all-versus-all comparison.")
-
         .subcommand(SubCommand::with_name("sketch")
             .about("Builds sketches from a dataset and saves them to a file.")
             .arg(Arg::with_name("input_fof").long("input-fof").value_name("FILE").help("Input dataset: a file of FASTA/Q file paths.").takes_value(true))
@@ -154,11 +154,11 @@ fn main() {
             builder.index_fasta_file(fasta_file);
         }
         
-        let index = builder.into_final_index(compress);
+        let index = builder.into_final_index(compress, zstd_level).expect("Failed to finalize index.");
         println!("Sketching took {} seconds.", start_time.elapsed().as_secs());
         
         println!("Dumping sketch index to file: {}", output_file);
-        if let Err(e) = index.dump_index_disk(output_file, zstd_level) {
+        if let Err(e) = index.dump_index_disk(output_file) {
             eprintln!("Error dumping index: {}", e);
         }
 
@@ -200,7 +200,7 @@ fn main() {
             } else if let Some(fasta_file) = matches.value_of("ref_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index(compress);
+            let index = builder.into_final_index(compress, zstd_level).expect("Failed to finalize reference index.");
             println!("Reference indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
@@ -216,7 +216,7 @@ fn main() {
             } else if let Some(fasta_file) = matches.value_of("query_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index(compress);
+            let index = builder.into_final_index(compress, zstd_level).expect("Failed to finalize query index.");
             println!("Query indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
