@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
 use std::thread;
@@ -74,10 +74,10 @@ pub struct IndexBuilder {
     s: u64,
     sketch_size: u64,
     fingerprint_range: u64,
-    mi: u64,
+    mi: u32,
     // A vector of lists. Each list corresponds to a sketch position
-    // and stores (doc_id, fingerprint) pairs.
-    intermediate_data: Vec<Mutex<Vec<(u32, u64)>>>,
+    // and stores only fingerprints. The document ID is implicit from the index.
+    intermediate_data: Vec<Mutex<Vec<AtomicU32>>>,
     genome_numbers: AtomicU64,
     empty_sketches_count: AtomicU64,
     sketch_mode: SketchMode,
@@ -120,7 +120,7 @@ impl IndexBuilder {
             s,
             sketch_size: s,
             fingerprint_range,
-            mi: u64::MAX,
+            mi: u32::MAX,
             intermediate_data,
             genome_numbers: AtomicU64::new(0),
             empty_sketches_count: AtomicU64::new(0),
@@ -130,16 +130,19 @@ impl IndexBuilder {
 
     /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
     pub fn into_final_index(self, compress: bool, zstd_level: i32) -> io::Result<Index> {
-        println!("Building inverted indexes and streaming to temporary file (in parallel)...");
+        println!("Building inverted indexes from fingerprint lists (in parallel)...");
         
         let temp_file = NamedTempFile::new()?;
         let path_str = temp_file.path().to_str().unwrap().to_string();
-        
+
         let position_buffers: Vec<Vec<u8>> = self.intermediate_data.into_par_iter().map(|pos_mutex| {
-            let pos_pairs = pos_mutex.into_inner().unwrap();
+            let fingerprint_list = pos_mutex.into_inner().unwrap();
             let mut inverted_index: Vec<Vec<u32>> = vec![Vec::new(); self.fingerprint_range as usize];
-            for (doc_id, fp) in pos_pairs {
-                inverted_index[fp as usize].push(doc_id);
+            for (doc_id, fp_atomic) in fingerprint_list.iter().enumerate() {
+                let fp = fp_atomic.load(Ordering::Relaxed);
+                if fp != self.mi {
+                    inverted_index[fp as usize].push(doc_id as u32);
+                }
             }
             
             let mut uncompressed_buffer = Vec::new();
@@ -170,13 +173,12 @@ impl IndexBuilder {
             }
             zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
         }).collect();
-
+        
         let mut toc = Vec::with_capacity(self.s as usize);
         
         { // Scope for the BufWriter to ensure it's dropped and flushed before we move temp_file
             let mut file = BufWriter::new(temp_file.as_file());
 
-            // Write placeholders for header and TOC
             let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 1 + 1;
             let toc_size = (self.s * 16) as u64;
             
@@ -186,7 +188,7 @@ impl IndexBuilder {
                 toc.push((current_offset, len));
                 current_offset += len;
             }
-
+            
             file.seek(SeekFrom::Start(0))?;
             file.write_u32::<LittleEndian>(self.ls)?;
             file.write_u32::<LittleEndian>(self.k)?;
@@ -205,7 +207,7 @@ impl IndexBuilder {
             for buffer in position_buffers {
                 file.write_all(&buffer)?;
             }
-        } // BufWriter is dropped here
+        }
         
         let empty_count = self.empty_sketches_count.load(Ordering::Relaxed);
         if empty_count > 0 {
@@ -223,7 +225,7 @@ impl IndexBuilder {
             s: self.s,
             sketch_size: self.sketch_size,
             fingerprint_range: self.fingerprint_range,
-            mi: self.mi,
+            mi: self.mi as u64,
             data: IndexData::OnDisk { handle: Some(Arc::new(NamedTempFile::from_parts(file_handle, path))), path: path_str, toc },
             genome_numbers: self.genome_numbers.load(Ordering::Relaxed),
             sketch_mode: self.sketch_mode,
@@ -241,22 +243,28 @@ impl IndexBuilder {
             let seqrec = record.expect("Invalid record in FASTA/FASTQ file");
             sequences.push(seqrec.seq().to_vec());
         }
-        self.genome_numbers
-            .store(sequences.len() as u64, Ordering::SeqCst);
+        let num_docs = sequences.len();
+        self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
+        
+        // Resize all position vectors to the number of documents under a single lock per vector
+        for pos_vec_mutex in &self.intermediate_data {
+            let mut pos_vec = pos_vec_mutex.lock().unwrap();
+            pos_vec.resize_with(num_docs, || AtomicU32::new(self.mi));
+        }
 
         sequences.into_par_iter().enumerate().for_each(|(i, seq)| {
             let seq_id = i as u32;
-            let mut sketch = vec![self.mi; self.s as usize];
+            let mut sketch = vec![self.mi as u64; self.s as usize];
             self.compute_sketch(SketchInput::Sequence(&seq), &mut sketch);
 
-            if sketch.iter().all(|&x| x == self.mi) {
+            if sketch.iter().all(|&x| x == self.mi as u64) {
                 self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos].lock().unwrap().push((seq_id, fp));
+                    self.intermediate_data[pos].lock().unwrap()[seq_id as usize].store(fp as u32, Ordering::Relaxed);
                 }
             }
         });
@@ -265,28 +273,35 @@ impl IndexBuilder {
     pub fn index_file_of_files(&self, fof_path: &str) {
         let reader = open_compressed_file(fof_path).expect("Could not open file of files");
         let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-        self.genome_numbers.store(files_to_process.len() as u64, Ordering::SeqCst);
+        let num_docs = files_to_process.len();
+        self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
+
+        // Resize all position vectors to the number of documents
+        for pos_vec_mutex in &self.intermediate_data {
+            let mut pos_vec = pos_vec_mutex.lock().unwrap();
+            pos_vec.resize_with(num_docs, || AtomicU32::new(self.mi));
+        }
 
         files_to_process.into_par_iter().enumerate().for_each(|(i, filepath)| {
             let seq_id = i as u32;
-            let mut sketch = vec![self.mi; self.s as usize];
+            let mut sketch = vec![self.mi as u64; self.s as usize];
             self.compute_sketch(SketchInput::FilePath(&filepath), &mut sketch);
 
-            if sketch.iter().all(|&x| x == self.mi) {
+            if sketch.iter().all(|&x| x == self.mi as u64) {
                 self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
                 return;
             }
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos].lock().unwrap().push((seq_id, fp));
+                    self.intermediate_data[pos].lock().unwrap()[seq_id as usize].store(fp as u32, Ordering::Relaxed);
                 }
             }
         });
     }
 
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
-        sketch.fill(self.mi);
+        sketch.fill(self.mi as u64);
         let mut empty_cell = self.s;
         let is_valid_dna = |c: &u8| matches!(*c, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
 
@@ -298,7 +313,7 @@ impl IndexBuilder {
                         let fp = revhash64(canon_hash);
                         let bucket_id = (unrevhash64(canon_hash) >> (64 - self.ls)) as usize;
                         if bucket_id < sketch.len() {
-                            if sketch[bucket_id] == self.mi {
+                            if sketch[bucket_id] == self.mi as u64 {
                                 empty_cell -= 1;
                                 sketch[bucket_id] = fp;
                             } else if sketch[bucket_id] > fp {
@@ -329,7 +344,7 @@ impl IndexBuilder {
         if empty_cell < self.s {
             self.sketch_densification(sketch, empty_cell as u32);
             for val in sketch.iter_mut() {
-                if *val != self.mi {
+                if *val != self.mi as u64 {
                     *val = match self.sketch_mode {
                         SketchMode::Default => *val & (self.fingerprint_range - 1),
                         SketchMode::Perfect => self.get_perfect_fingerprint(*val),
@@ -345,9 +360,9 @@ impl IndexBuilder {
         while empty_cell != 0 {
             let mut changes = Vec::new();
             for i in 0..size {
-                if sketch[i] != self.mi {
+                if sketch[i] != self.mi as u64 {
                     let hash_pos = (hash_family(sketch[i], step) % size as u64) as usize;
-                    if hash_pos < sketch.len() && sketch[hash_pos] == self.mi {
+                    if hash_pos < sketch.len() && sketch[hash_pos] == self.mi as u64 {
                         changes.push((hash_pos, sketch[i]));
                     }
                 }
@@ -355,7 +370,7 @@ impl IndexBuilder {
             if changes.is_empty() && empty_cell > 0 { break; }
 
             for (pos, val) in changes {
-                if sketch[pos] == self.mi {
+                if sketch[pos] == self.mi as u64 {
                     sketch[pos] = val;
                     empty_cell -= 1;
                     if empty_cell == 0 { return; }
@@ -366,7 +381,7 @@ impl IndexBuilder {
     }
 
     fn get_perfect_fingerprint(&self, hashed: u64) -> u64 {
-        if hashed == self.mi { return self.mi; }
+        if hashed == self.mi as u64 { return self.mi as u64; }
         let b = f128::from(hashed >> 32);
         let twopowern = f128::from(1u128 << 32);
         let ratio = f128::from(self.e) / f128::from(self.s);
