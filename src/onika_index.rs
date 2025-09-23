@@ -14,8 +14,9 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     mpsc, Arc, Mutex,
 };
-use std::thread;
 use std::sync::atomic::AtomicU64;
+
+use std::thread;
 
 use f128::f128;
 use std::fmt::Write as FmtWrite;
@@ -196,15 +197,23 @@ impl IndexBuilder {
         }
     }
 
-    pub fn index_file_line_by_line(&self, filestr: &str) {
-        let reader = open_compressed_file(filestr).expect("Could not open file with sequences line by line");
-        let lines: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-        self.genome_numbers.store(lines.len() as u64, Ordering::SeqCst);
+    pub fn index_fasta_file(&self, filestr: &str) {
+        let reader = open_compressed_file(filestr).expect("Could not open FASTA/FASTQ file");
+        let mut fastx_reader =
+            needletail::parse_fastx_reader(reader).expect("Invalid FASTA/FASTQ format");
 
-        lines.into_par_iter().enumerate().for_each(|(i, line)| {
+        let mut sequences = Vec::new();
+        while let Some(record) = fastx_reader.next() {
+            let seqrec = record.expect("Invalid record in FASTA/FASTQ file");
+            sequences.push(seqrec.seq().to_vec());
+        }
+        self.genome_numbers
+            .store(sequences.len() as u64, Ordering::SeqCst);
+
+        sequences.into_par_iter().enumerate().for_each(|(i, seq)| {
             let seq_id = i as u32;
             let mut sketch = vec![self.mi; self.s as usize];
-            self.compute_sketch(SketchInput::Sequence(line.as_bytes()), &mut sketch);
+            self.compute_sketch(SketchInput::Sequence(&seq), &mut sketch);
 
             if sketch.iter().all(|&x| x == self.mi) {
                 self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
@@ -213,7 +222,10 @@ impl IndexBuilder {
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos][fp as usize].lock().unwrap().push(seq_id);
+                    self.intermediate_data[pos][fp as usize]
+                        .lock()
+                        .unwrap()
+                        .push(seq_id);
                 }
             }
         });
@@ -393,25 +405,22 @@ impl Index {
             zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
         }).collect();
         
-        // Correctly calculate header and TOC size to find the start of data.
         let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 1 + 1;
-        let toc_size = (self.s * 16) as u64; // 2 * u64 per entry
+        let toc_size = (self.s * 16) as u64;
         
-        let mut current_offset = header_size + toc_size;
         let mut toc = Vec::with_capacity(self.s as usize);
+        let mut current_offset = header_size + toc_size;
         for buffer in &position_buffers {
             let len = buffer.len() as u64;
             toc.push((current_offset, len));
             current_offset += len;
         }
         
-        // Write the now-correct TOC
         for (offset, len) in &toc {
             file.write_u64::<LittleEndian>(*offset)?;
             file.write_u64::<LittleEndian>(*len)?;
         }
         
-        // Write the data blocks
         for compressed_buffer in position_buffers {
             file.write_all(&compressed_buffer)?;
         }
