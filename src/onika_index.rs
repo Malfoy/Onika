@@ -129,11 +129,17 @@ impl IndexBuilder {
         }
     }
 
-    /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
-    pub fn into_final_index(self, compress: bool, zstd_level: i32) -> io::Result<Index> {
+  /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
+    pub fn into_final_index(self, output_path: &str, compress: bool, zstd_level: i32) -> io::Result<Index> {
         println!("Building inverted indexes from fingerprint lists (in parallel)...");
         
-        let temp_file = NamedTempFile::new()?;
+        // --- MODIFICATION START ---
+        // 1. Determine the directory where the output file will be saved.
+        let output_dir = Path::new(output_path).parent().unwrap_or_else(|| Path::new("."));
+        // 2. Create the temporary file in that specific directory.
+        let temp_file = tempfile::Builder::new().prefix(".tmp-index-").tempfile_in(output_dir)?;
+        // --- MODIFICATION END ---
+
         let path_str = temp_file.path().to_str().unwrap().to_string();
 
         let position_buffers: Vec<Vec<u8>> = self.intermediate_data.into_par_iter().map(|pos_mutex| {
@@ -233,7 +239,6 @@ impl IndexBuilder {
             is_compressed: compress,
         })
     }
-
     pub fn index_fasta_file(&self, filestr: &str) {
         let reader = open_compressed_file(filestr).expect("Could not open FASTA/FASTQ file");
         let mut fastx_reader =

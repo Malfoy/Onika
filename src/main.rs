@@ -154,7 +154,7 @@ fn main() {
             builder.index_fasta_file(fasta_file);
         }
         
-        let index = builder.into_final_index(compress, zstd_level).expect("Failed to finalize index.");
+        let index = builder.into_final_index("tmp_onika",compress, zstd_level).expect("Failed to finalize index.");
         println!("Sketching took {} seconds.", start_time.elapsed().as_secs());
         
         println!("Dumping sketch index to file: {}", output_file);
@@ -200,7 +200,7 @@ fn main() {
             } else if let Some(fasta_file) = matches.value_of("ref_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index(compress, zstd_level).expect("Failed to finalize reference index.");
+            let index = builder.into_final_index("tmp_onika",compress, zstd_level).expect("Failed to finalize reference index.");
             println!("Reference indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
@@ -216,7 +216,7 @@ fn main() {
             } else if let Some(fasta_file) = matches.value_of("query_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index(compress, zstd_level).expect("Failed to finalize query index.");
+            let index = builder.into_final_index("tmp_onika",compress, zstd_level).expect("Failed to finalize query index.");
             println!("Query indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
