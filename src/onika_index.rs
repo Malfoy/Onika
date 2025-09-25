@@ -18,6 +18,7 @@ use std::sync::{
 };
 use std::thread;
 use itertools::Itertools;
+use niffler;
 
 
 use f128::f128;
@@ -86,19 +87,26 @@ pub struct IndexBuilder {
     sketch_mode: SketchMode,
 }
 
-/// Opens a file, transparently handling .gz and .zst compression.
 pub(crate) fn open_compressed_file(path: &str) -> io::Result<Box<dyn BufRead + Send>> {
     let file = File::open(path)?;
-    match Path::new(path).extension().and_then(OsStr::to_str) {
-        Some("gz") => {
-            let decoder = GzDecoder::new(file);
-            Ok(Box::new(BufReader::new(decoder)))
-        }
-        Some("zst") => {
-            let decoder = zstd::stream::read::Decoder::new(file)?;
-            Ok(Box::new(BufReader::new(decoder)))
-        }
-        _ => Ok(Box::new(BufReader::new(file))),
+    let mut reader = BufReader::new(file);
+
+    // Peek at the first few bytes of the file to identify the compression format.
+    let magic_bytes = reader.fill_buf()?;
+
+    if magic_bytes.starts_with(&[0x1f, 0x8b]) {
+        // Gzip magic bytes: 1f 8b
+        // We must create a new BufReader because GzDecoder consumes the original.
+        let file = File::open(path)?;
+        Ok(Box::new(BufReader::new(GzDecoder::new(file))))
+    } else if magic_bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        // Zstandard magic bytes: 28 b5 2f fd
+        let file = File::open(path)?;
+        let decoder = zstd::stream::read::Decoder::new(file)?;
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        // Not compressed or unknown, treat as plain text.
+        Ok(Box::new(reader))
     }
 }
 
