@@ -7,6 +7,7 @@ use needletail::parse_fastx_reader;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder; // Added for thread count control
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -479,8 +480,8 @@ impl Index {
             println!("Number of Genomes: {}", self.genome_numbers);
         }
     }
-
-    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str, num_io_threads: usize, io_buffer_size: usize) {
+    
+    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str, num_io_threads: usize, io_buffer_size: usize, num_compute_threads: usize) {
         println!("\n--- Starting All-Versus-All Comparison ---");
         let start_time = std::time::Instant::now();
 
@@ -495,107 +496,114 @@ impl Index {
         let scores_shards: Vec<Mutex<AHashMap<(u32, u32), u32>>> =
             (0..num_shards).map(|_| Mutex::new(AHashMap::default())).collect();
 
-        // This function body will now handle both InMemory and OnDisk cases.
-        if let (IndexData::InMemory(ref_data), IndexData::InMemory(query_data)) = (&self.data, &query_index.data) {
-            // --- In-Memory Comparison (No I/O threads needed) ---
-            (0..self.sketch_size as usize).into_par_iter().for_each(|pos| {
-                let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
-                let ref_pos_index = &ref_data[pos];
-                let query_pos_index = &query_data[pos];
+        // Build a dedicated thread pool for the main computation.
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(num_compute_threads)
+            .build()
+            .unwrap();
 
-                for fp in 0..self.fingerprint_range as usize {
-                    let (ref_count, ref_bytes) = &ref_pos_index[fp];
-                    if *ref_count > 0 {
-                        let (query_count, query_bytes) = &query_pos_index[fp];
-                        if *query_count > 0 {
-                            let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
-                            let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
-                            for &query_gid in &query_gids {
-                                for &ref_gid in &ref_gids {
-                                    let key = (query_gid, ref_gid);
-                                    let shard_index = key.0 as usize % num_shards;
-                                    let mut shard = scores_shards[shard_index].lock().unwrap();
-                                    if !perform_pruning {
-                                        *shard.entry(key).or_insert(0) += 1;
-                                    } else if let Some(score) = shard.get_mut(&key) {
-                                        *score += 1;
-                                        if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
-                                    } else if 1 + remaining_hits_possible >= min_required_score as u64 {
-                                        shard.insert(key, 1);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        } else {
-            // --- On-Disk Pipelined Comparison with multiple I/O threads ---
-            type PosData = (usize, Vec<(u32, Vec<u8>)>, Vec<(u32, Vec<u8>)>);
-            let (tx, rx) = mpsc::sync_channel::<PosData>(io_buffer_size);
-            
-            let position_counter = Arc::new(AtomicUsize::new(0));
-            let mut producer_handles = Vec::new();
+        // The `pool.install` block ensures all Rayon operations inside use our custom pool.
+        pool.install(|| {
+            if let (IndexData::InMemory(ref_data), IndexData::InMemory(query_data)) = (&self.data, &query_index.data) {
+                // --- In-Memory Comparison (No I/O threads needed) ---
+                (0..self.sketch_size as usize).into_par_iter().for_each(|pos| {
+                    let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
+                    let ref_pos_index = &ref_data[pos];
+                    let query_pos_index = &query_data[pos];
 
-            for _ in 0..num_io_threads {
-                let tx_clone = tx.clone();
-                let ref_path = self.path_for_reading().to_string();
-                let query_path = query_index.path_for_reading().to_string();
-                let ref_toc = self.toc_for_reading().to_vec();
-                let query_toc = query_index.toc_for_reading().to_vec();
-                let s = self.s;
-                let fp_range = self.fingerprint_range;
-                let counter_clone = Arc::clone(&position_counter);
-
-                producer_handles.push(thread::spawn(move || {
-                    let mut ref_file = File::open(ref_path).expect("Cannot open reference index file in producer.");
-                    let mut query_file = File::open(query_path).expect("Cannot open query index file in producer.");
-                    loop {
-                        let pos = counter_clone.fetch_add(1, Ordering::SeqCst);
-                        if pos >= s as usize { break; }
-
-                        let ref_pos_data = read_pos_from_file(&mut ref_file, &ref_toc, pos, fp_range);
-                        let query_pos_data = read_pos_from_file(&mut query_file, &query_toc, pos, fp_range);
-                        if tx_clone.send((pos, ref_pos_data, query_pos_data)).is_err() { break; }
-                    }
-                }));
-            }
-            drop(tx); // Drop the original sender so the channel closes when all producers are done.
-
-            rx.into_iter().par_bridge().for_each(|(pos, ref_pos_index, query_pos_index)| {
-                let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
-                // Since a thread owns an entire pos, we can parallelize the inner loop
-                (0..self.fingerprint_range as usize).into_par_iter().for_each(|fp| {
-                    let (ref_count, ref_bytes) = &ref_pos_index[fp];
-                    if *ref_count > 0 {
-                        let (query_count, query_bytes) = &query_pos_index[fp];
-                        if *query_count > 0 {
-                            let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
-                            let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
-                            for &query_gid in &query_gids {
-                                for &ref_gid in &ref_gids {
-                                    let key = (query_gid, ref_gid);
-                                    let shard_index = key.0 as usize % num_shards;
-                                    let mut shard = scores_shards[shard_index].lock().unwrap();
-                                    if !perform_pruning {
-                                        *shard.entry(key).or_insert(0) += 1;
-                                    } else if let Some(score) = shard.get_mut(&key) {
-                                        *score += 1;
-                                        if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
-                                    } else if 1 + remaining_hits_possible >= min_required_score as u64 {
-                                        shard.insert(key, 1);
+                    for fp in 0..self.fingerprint_range as usize {
+                        let (ref_count, ref_bytes) = &ref_pos_index[fp];
+                        if *ref_count > 0 {
+                            let (query_count, query_bytes) = &query_pos_index[fp];
+                            if *query_count > 0 {
+                                let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
+                                let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
+                                for &query_gid in &query_gids {
+                                    for &ref_gid in &ref_gids {
+                                        let key = (query_gid, ref_gid);
+                                        let shard_index = key.0 as usize % num_shards;
+                                        let mut shard = scores_shards[shard_index].lock().unwrap();
+                                        if !perform_pruning {
+                                            *shard.entry(key).or_insert(0) += 1;
+                                        } else if let Some(score) = shard.get_mut(&key) {
+                                            *score += 1;
+                                            if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
+                                        } else if 1 + remaining_hits_possible >= min_required_score as u64 {
+                                            shard.insert(key, 1);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 });
-            });
+            } else {
+                // --- On-Disk Pipelined Comparison with multiple I/O threads ---
+                type PosData = (usize, Vec<(u32, Vec<u8>)>, Vec<(u32, Vec<u8>)>);
+                let (tx, rx) = mpsc::sync_channel::<PosData>(io_buffer_size);
+                
+                let position_counter = Arc::new(AtomicUsize::new(0));
+                let mut producer_handles = Vec::new();
 
-            for handle in producer_handles {
-                handle.join().unwrap();
+                for _ in 0..num_io_threads {
+                    let tx_clone = tx.clone();
+                    let ref_path = self.path_for_reading().to_string();
+                    let query_path = query_index.path_for_reading().to_string();
+                    let ref_toc = self.toc_for_reading().to_vec();
+                    let query_toc = query_index.toc_for_reading().to_vec();
+                    let s = self.s;
+                    let fp_range = self.fingerprint_range;
+                    let counter_clone = Arc::clone(&position_counter);
+
+                    producer_handles.push(thread::spawn(move || {
+                        let mut ref_file = File::open(ref_path).expect("Cannot open reference index file in producer.");
+                        let mut query_file = File::open(query_path).expect("Cannot open query index file in producer.");
+                        loop {
+                            let pos = counter_clone.fetch_add(1, Ordering::SeqCst);
+                            if pos >= s as usize { break; }
+
+                            let ref_pos_data = read_pos_from_file(&mut ref_file, &ref_toc, pos, fp_range);
+                            let query_pos_data = read_pos_from_file(&mut query_file, &query_toc, pos, fp_range);
+                            if tx_clone.send((pos, ref_pos_data, query_pos_data)).is_err() { break; }
+                        }
+                    }));
+                }
+                drop(tx); // Drop the original sender so the channel closes when all producers are done.
+
+                rx.into_iter().par_bridge().for_each(|(pos, ref_pos_index, query_pos_index)| {
+                    let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
+                    (0..self.fingerprint_range as usize).into_par_iter().for_each(|fp| {
+                        let (ref_count, ref_bytes) = &ref_pos_index[fp];
+                        if *ref_count > 0 {
+                            let (query_count, query_bytes) = &query_pos_index[fp];
+                            if *query_count > 0 {
+                                let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
+                                let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
+                                for &query_gid in &query_gids {
+                                    for &ref_gid in &ref_gids {
+                                        let key = (query_gid, ref_gid);
+                                        let shard_index = key.0 as usize % num_shards;
+                                        let mut shard = scores_shards[shard_index].lock().unwrap();
+                                        if !perform_pruning {
+                                            *shard.entry(key).or_insert(0) += 1;
+                                        } else if let Some(score) = shard.get_mut(&key) {
+                                            *score += 1;
+                                            if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
+                                        } else if 1 + remaining_hits_possible >= min_required_score as u64 {
+                                            shard.insert(key, 1);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                });
+
+                for handle in producer_handles {
+                    handle.join().unwrap();
+                }
             }
-        }
+        });
         
         println!("Score calculation finished in {} seconds. Aggregating and formatting results...", start_time.elapsed().as_secs());
 
@@ -695,4 +703,3 @@ fn decode_gid_list(count: u32, bytes: &[u8], is_compressed: bool) -> Vec<u32> {
         gids
     }
 }
-

@@ -116,8 +116,8 @@ fn main() {
             .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
-            .arg(Arg::with_name("io_threads").long("io-threads").value_name("INT").default_value("2").takes_value(true))
-            .arg(Arg::with_name("io_buffer").long("io-buffer").value_name("INT").default_value("4").takes_value(true))
+            .arg(Arg::with_name("io_threads").long("io-threads").value_name("INT").default_value("16").takes_value(true))
+            .arg(Arg::with_name("io_buffer").long("io-buffer").value_name("INT").default_value("8").takes_value(true))
         )
         .get_matches();
 
@@ -173,8 +173,8 @@ fn main() {
         let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
         let is_matrix = matches.is_present("matrix");
         let compress = !matches.is_present("no_compress");
-        let io_threads = value_t!(matches, "io_threads", usize).unwrap_or(2);
-        let io_buffer = value_t!(matches, "io_buffer", usize).unwrap_or(4);
+        let io_threads = value_t!(matches, "io_threads", usize).unwrap_or(16);
+        let io_buffer = value_t!(matches, "io_buffer", usize).unwrap_or(16);
         
         let w = value_t!(matches, "w", u32).unwrap_or(16);
         let s = value_t!(matches, "s", u32).unwrap_or(16);
@@ -228,7 +228,7 @@ fn main() {
             query_index.print_stats();
         }
         
-        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file, io_threads, io_buffer);
+        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file, io_threads, io_buffer,32);
     }
 }
 
