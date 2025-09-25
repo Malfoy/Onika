@@ -9,7 +9,10 @@ extern crate needletail;
 extern crate byteorder;
 extern crate ahash;
 extern crate tempfile;
+use jemallocator::Jemalloc;
 
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 mod onika_index;
 mod utils;
