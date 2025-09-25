@@ -7,7 +7,7 @@ use needletail::parse_fastx_reader;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
-use rayon::ThreadPoolBuilder; // Added for thread count control
+use rayon::ThreadPoolBuilder;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -43,7 +43,6 @@ pub enum SketchInput<'a> {
 pub enum IndexData {
     InMemory(Vec<Vec<(u32, Vec<u8>)>>),
     OnDisk {
-        // Option is used to hold the NamedTempFile guard until it's persisted.
         handle: Option<Arc<NamedTempFile>>,
         path: String,
         toc: Vec<(u64, u64)>, // offset, length
@@ -76,9 +75,10 @@ pub struct IndexBuilder {
     sketch_size: u64,
     fingerprint_range: u64,
     mi: u32,
-    // A vector of lists. Each list corresponds to a sketch position
-    // and stores only fingerprints. The document ID is implicit from the index.
-    intermediate_data: Vec<Mutex<Vec<AtomicU32>>>,
+    // A single, flat vector representing a 2D matrix (pos x doc_id).
+    intermediate_data: Vec<AtomicU32>,
+    // Store num_docs to know the matrix width.
+    num_docs: usize, 
     genome_numbers: AtomicU64,
     empty_sketches_count: AtomicU64,
     sketch_mode: SketchMode,
@@ -106,13 +106,6 @@ impl IndexBuilder {
         let s = 1u64 << ils;
         let fingerprint_range = 1u64 << iw;
 
-        println!(
-            "Allocating {} lists for sketch positions...", s
-        );
-        let intermediate_data = (0..s)
-            .map(|_| Mutex::new(Vec::new()))
-            .collect();
-
         Self {
             ls: ils,
             w: iw,
@@ -122,80 +115,75 @@ impl IndexBuilder {
             sketch_size: s,
             fingerprint_range,
             mi: u32::MAX,
-            intermediate_data,
+            intermediate_data: Vec::new(),
+            num_docs: 0,
             genome_numbers: AtomicU64::new(0),
             empty_sketches_count: AtomicU64::new(0),
             sketch_mode: mode,
         }
     }
 
-  /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
+    /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
     pub fn into_final_index(self, output_path: &str, compress: bool, zstd_level: i32) -> io::Result<Index> {
         println!("Building inverted indexes from fingerprint lists (in parallel)...");
         
-        // --- MODIFICATION START ---
-        // 1. Determine the directory where the output file will be saved.
         let output_dir = Path::new(output_path).parent().unwrap_or_else(|| Path::new("."));
-        // 2. Create the temporary file in that specific directory.
         let temp_file = tempfile::Builder::new().prefix(".tmp-index-").tempfile_in(output_dir)?;
-        // --- MODIFICATION END ---
-
         let path_str = temp_file.path().to_str().unwrap().to_string();
 
-        let position_buffers: Vec<Vec<u8>> = self.intermediate_data.into_par_iter().map(|pos_mutex| {
-            let fingerprint_list = pos_mutex.into_inner().unwrap();
-            let mut inverted_index: Vec<Vec<u32>> = vec![Vec::new(); self.fingerprint_range as usize];
-            for (doc_id, fp_atomic) in fingerprint_list.iter().enumerate() {
-                let fp = fp_atomic.load(Ordering::Relaxed);
-                if fp != self.mi {
-                    inverted_index[fp as usize].push(doc_id as u32);
+        let position_buffers: Vec<Vec<u8>> = self.intermediate_data
+            .par_chunks(self.num_docs)
+            .map(|fingerprint_chunk| {
+                let mut inverted_index: Vec<Vec<u32>> = vec![Vec::new(); self.fingerprint_range as usize];
+                for (doc_id, fp_atomic) in fingerprint_chunk.iter().enumerate() {
+                    let fp = fp_atomic.load(Ordering::Relaxed);
+                    if fp != self.mi {
+                        inverted_index[fp as usize].push(doc_id as u32);
+                    }
                 }
-            }
-            
-            let mut uncompressed_buffer = Vec::new();
-            for mut gids in inverted_index {
-                let original_count = gids.len() as u32;
-                let gids_bytes = if compress && !gids.is_empty() {
-                    gids.sort_unstable();
-                    let mut prev = gids[0];
-                    for i in 1..gids.len() {
-                        let current = gids[i];
-                        gids[i] = current.wrapping_sub(prev);
-                        prev = current;
-                    }
-                    let mut encoded_data = vec![0; 5 * gids.len()];
-                    let encoded_len = stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
-                    encoded_data.truncate(encoded_len);
-                    encoded_data
-                } else {
-                    let mut bytes = Vec::with_capacity(gids.len() * 4);
-                    for gid in gids {
-                        bytes.write_u32::<LittleEndian>(gid).unwrap();
-                    }
-                    bytes
-                };
-                uncompressed_buffer.write_u32::<LittleEndian>(original_count).unwrap();
-                uncompressed_buffer.write_u32::<LittleEndian>(gids_bytes.len() as u32).unwrap();
-                uncompressed_buffer.write_all(&gids_bytes).unwrap();
-            }
-            zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
-        }).collect();
+                
+                let mut uncompressed_buffer = Vec::new();
+                for mut gids in inverted_index {
+                    let original_count = gids.len() as u32;
+                    let gids_bytes = if compress && !gids.is_empty() {
+                        gids.sort_unstable();
+                        let mut prev = gids[0];
+                        for i in 1..gids.len() {
+                            let current = gids[i];
+                            gids[i] = current.wrapping_sub(prev);
+                            prev = current;
+                        }
+                        let mut encoded_data = vec![0; 5 * gids.len()];
+                        let encoded_len = stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
+                        encoded_data.truncate(encoded_len);
+                        encoded_data
+                    } else {
+                        let mut bytes = Vec::with_capacity(gids.len() * 4);
+                        for gid in gids {
+                            bytes.write_u32::<LittleEndian>(gid).unwrap();
+                        }
+                        bytes
+                    };
+                    uncompressed_buffer.write_u32::<LittleEndian>(original_count).unwrap();
+                    uncompressed_buffer.write_u32::<LittleEndian>(gids_bytes.len() as u32).unwrap();
+                    uncompressed_buffer.write_all(&gids_bytes).unwrap();
+                }
+                zstd::encode_all(&uncompressed_buffer[..], zstd_level).unwrap()
+            })
+            .collect();
         
         let mut toc = Vec::with_capacity(self.s as usize);
         
-        { // Scope for the BufWriter to ensure it's dropped and flushed before we move temp_file
+        {
             let mut file = BufWriter::new(temp_file.as_file());
-
             let header_size = 4 + 4 + 4 + 4 + 8 + 8 + 1 + 1;
             let toc_size = (self.s * 16) as u64;
-            
             let mut current_offset = header_size + toc_size;
             for buffer in &position_buffers {
                 let len = buffer.len() as u64;
                 toc.push((current_offset, len));
                 current_offset += len;
             }
-            
             file.seek(SeekFrom::Start(0))?;
             file.write_u32::<LittleEndian>(self.ls)?;
             file.write_u32::<LittleEndian>(self.k)?;
@@ -205,12 +193,10 @@ impl IndexBuilder {
             file.write_u64::<LittleEndian>(self.genome_numbers.load(Ordering::Relaxed))?;
             file.write_u8(self.sketch_mode as u8)?;
             file.write_u8(compress as u8)?;
-
             for (offset, len) in &toc {
                 file.write_u64::<LittleEndian>(*offset)?;
                 file.write_u64::<LittleEndian>(*len)?;
             }
-
             for buffer in position_buffers {
                 file.write_all(&buffer)?;
             }
@@ -239,24 +225,31 @@ impl IndexBuilder {
             is_compressed: compress,
         })
     }
-    pub fn index_fasta_file(&self, filestr: &str) {
+
+
+
+
+pub fn index_fasta_file(&mut self, filestr: &str) {
         let reader = open_compressed_file(filestr).expect("Could not open FASTA/FASTQ file");
         let mut fastx_reader =
             needletail::parse_fastx_reader(reader).expect("Invalid FASTA/FASTQ format");
 
+        // Use a simple loop to collect sequences, which is the correct pattern.
         let mut sequences = Vec::new();
         while let Some(record) = fastx_reader.next() {
             let seqrec = record.expect("Invalid record in FASTA/FASTQ file");
             sequences.push(seqrec.seq().to_vec());
         }
+        
         let num_docs = sequences.len();
+        self.num_docs = num_docs;
         self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
         
-        // Resize all position vectors to the number of documents under a single lock per vector
-        for pos_vec_mutex in &self.intermediate_data {
-            let mut pos_vec = pos_vec_mutex.lock().unwrap();
-            pos_vec.resize_with(num_docs, || AtomicU32::new(self.mi));
-        }
+        let total_size = self.s as usize * num_docs;
+        self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
+        
+        // This can now be safely shared across threads.
+        let data_arc = Arc::new(&self.intermediate_data);
 
         sequences.into_par_iter().enumerate().for_each(|(i, seq)| {
             let seq_id = i as u32;
@@ -270,23 +263,27 @@ impl IndexBuilder {
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos].lock().unwrap()[seq_id as usize].store(fp as u32, Ordering::Relaxed);
+                    let index = pos * num_docs + (seq_id as usize);
+                    data_arc[index].store(fp as u32, Ordering::Relaxed);
                 }
             }
         });
     }
 
-    pub fn index_file_of_files(&self, fof_path: &str) {
+
+
+
+    pub fn index_file_of_files(&mut self, fof_path: &str) {
         let reader = open_compressed_file(fof_path).expect("Could not open file of files");
         let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
         let num_docs = files_to_process.len();
+        
+        self.num_docs = num_docs;
         self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
 
-        // Resize all position vectors to the number of documents
-        for pos_vec_mutex in &self.intermediate_data {
-            let mut pos_vec = pos_vec_mutex.lock().unwrap();
-            pos_vec.resize_with(num_docs, || AtomicU32::new(self.mi));
-        }
+        let total_size = self.s as usize * num_docs;
+        self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
+        let data_arc = Arc::new(&self.intermediate_data);
 
         files_to_process.into_par_iter().enumerate().for_each(|(i, filepath)| {
             let seq_id = i as u32;
@@ -300,7 +297,8 @@ impl IndexBuilder {
 
             for (pos, &fp) in sketch.iter().enumerate() {
                 if fp < self.fingerprint_range {
-                    self.intermediate_data[pos].lock().unwrap()[seq_id as usize].store(fp as u32, Ordering::Relaxed);
+                    let index = pos * num_docs + (seq_id as usize);
+                    data_arc[index].store(fp as u32, Ordering::Relaxed);
                 }
             }
         });
@@ -434,18 +432,15 @@ impl Index {
         match self.data {
             IndexData::OnDisk{ handle, path, ..} => {
                 if let Some(temp_handle) = handle {
-                    // This was a temporary file, persist it to the final destination
                     match Arc::try_unwrap(temp_handle) {
                         Ok(temp_file) => { temp_file.persist(filestr)?; },
                         Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to unwrap Arc for temp file")),
                     }
                 } else {
-                    // This was already a permanent file, copy it.
                     std::fs::copy(&path, filestr)?;
                 }
             },
             IndexData::InMemory(_) => {
-                // This case should ideally not be hit if builder always creates OnDisk indexes.
                 panic!("dump_index_disk called on an in-memory index, which is not supported by the new design.");
             }
         }
@@ -501,16 +496,13 @@ impl Index {
         let scores_shards: Vec<Mutex<AHashMap<(u32, u32), u32>>> =
             (0..num_shards).map(|_| Mutex::new(AHashMap::default())).collect();
 
-        // Build a dedicated thread pool for the main computation.
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_compute_threads)
             .build()
             .unwrap();
 
-        // The `pool.install` block ensures all Rayon operations inside use our custom pool.
         pool.install(|| {
             if let (IndexData::InMemory(ref_data), IndexData::InMemory(query_data)) = (&self.data, &query_index.data) {
-                // --- In-Memory Comparison (No I/O threads needed) ---
                 (0..self.sketch_size as usize).into_par_iter().for_each(|pos| {
                     let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
                     let ref_pos_index = &ref_data[pos];
@@ -543,7 +535,6 @@ impl Index {
                     }
                 });
             } else {
-                // --- On-Disk Pipelined Comparison with multiple I/O threads ---
                 type PosData = (usize, Vec<(u32, Vec<u8>)>, Vec<(u32, Vec<u8>)>);
                 let (tx, rx) = mpsc::sync_channel::<PosData>(io_buffer_size);
                 
@@ -573,7 +564,7 @@ impl Index {
                         }
                     }));
                 }
-                drop(tx); // Drop the original sender so the channel closes when all producers are done.
+                drop(tx);
 
                 rx.into_iter().par_bridge().for_each(|(pos, ref_pos_index, query_pos_index)| {
                     let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
@@ -670,7 +661,6 @@ impl Index {
 fn read_pos_from_file(file: &mut File, toc: &[(u64, u64)], pos: usize, fp_range: u64) -> Vec<(u32, Vec<u8>)> {
     let (offset, len) = toc[pos];
     if len == 0 { 
-        // Return a correctly sized vector of empty lists
         return vec![(0, Vec::new()); fp_range as usize];
     }
     

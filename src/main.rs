@@ -146,7 +146,7 @@ fn main() {
         
         println!("--- Building Sketch Index ---");
         let start_time = Instant::now();
-        let builder = IndexBuilder::new(s, k, w, e, sketch_mode);
+        let mut builder = IndexBuilder::new(s, k, w, e, sketch_mode);
 
         if let Some(fof) = matches.value_of("input_fof") {
             builder.index_file_of_files(fof);
@@ -194,7 +194,7 @@ fn main() {
         } else {
             println!("--- Building Reference Index On-the-fly ---");
             let start = Instant::now();
-            let builder = IndexBuilder::new(s, k, w, e, sketch_mode);
+            let mut builder = IndexBuilder::new(s, k, w, e, sketch_mode);
             if let Some(fof) = matches.value_of("ref_fof") {
                 builder.index_file_of_files(fof);
             } else if let Some(fasta_file) = matches.value_of("ref_fasta") {
@@ -210,7 +210,7 @@ fn main() {
         } else {
             println!("\n--- Building Query Index On-the-fly ---");
             let start = Instant::now();
-            let builder = IndexBuilder::new(s, k, w, e, sketch_mode);
+            let mut builder = IndexBuilder::new(s, k, w, e, sketch_mode);
             if let Some(fof) = matches.value_of("query_fof") {
                 builder.index_file_of_files(fof);
             } else if let Some(fasta_file) = matches.value_of("query_fasta") {
