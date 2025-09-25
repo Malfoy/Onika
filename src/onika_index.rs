@@ -17,6 +17,8 @@ use std::sync::{
     mpsc, Arc, Mutex,
 };
 use std::thread;
+use itertools::Itertools;
+
 
 use f128::f128;
 use std::fmt::Write as FmtWrite;
@@ -271,7 +273,6 @@ pub fn index_fasta_file(&mut self, filestr: &str) {
     }
 
 
-
 pub fn index_file_of_files(&mut self, fof_path: &str) {
     let reader = open_compressed_file(fof_path).expect("Could not open file of files");
     let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
@@ -284,30 +285,39 @@ pub fn index_file_of_files(&mut self, fof_path: &str) {
     self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
     let data_arc = Arc::new(&self.intermediate_data);
 
+    // A tunable parameter. A value between 16 and 64 is often a good start.
+    const CHUNK_SIZE: usize = 32;
+
     // --- CORRECTED SCHEDULER LOGIC ---
+    // Use Rayon's native `par_chunks` for efficient, balanced parallel processing.
     files_to_process
-        .into_iter()
-        .enumerate()  // 1. Enumerate the sequential iterator to get the index (i).
-        .par_bridge() // 2. Bridge the (index, filepath) tuples for load balancing.
-        .for_each(|(i, filepath)| {
-            let seq_id = i as u32;
-            let mut sketch = vec![self.mi as u64; self.s as usize];
-            self.compute_sketch(SketchInput::FilePath(&filepath), &mut sketch);
+        .par_chunks(CHUNK_SIZE)
+        .enumerate() // This gives us the index of the chunk, not the item.
+        .for_each(|(chunk_index, file_chunk)| {
+            // We calculate the original index of each file manually.
+            let base_index = chunk_index * CHUNK_SIZE;
 
-            if sketch.iter().all(|&x| x == self.mi as u64) {
-                self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
+            for (i_in_chunk, filepath) in file_chunk.iter().enumerate() {
+                let i = base_index + i_in_chunk;
+                let seq_id = i as u32;
+                
+                let mut sketch = vec![self.mi as u64; self.s as usize];
+                self.compute_sketch(SketchInput::FilePath(filepath), &mut sketch);
 
-            for (pos, &fp) in sketch.iter().enumerate() {
-                if fp < self.fingerprint_range {
-                    let index = pos * num_docs + (seq_id as usize);
-                    data_arc[index].store(fp as u32, Ordering::Relaxed);
+                if sketch.iter().all(|&x| x == self.mi as u64) {
+                    self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
+                    continue; // Continue to the next file in the chunk
+                }
+
+                for (pos, &fp) in sketch.iter().enumerate() {
+                    if fp < self.fingerprint_range {
+                        let index = pos * num_docs + (seq_id as usize);
+                        data_arc[index].store(fp as u32, Ordering::Relaxed);
+                    }
                 }
             }
         });
 }
-
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
         sketch.fill(self.mi as u64);
         let mut empty_cell = self.s;
