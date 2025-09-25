@@ -117,7 +117,7 @@ fn main() {
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
             .arg(Arg::with_name("io_threads").long("io-threads").value_name("INT").default_value("16").takes_value(true))
-            .arg(Arg::with_name("io_buffer").long("io-buffer").value_name("INT").default_value("8").takes_value(true))
+            .arg(Arg::with_name("io_buffer").long("io-buffer").value_name("INT").default_value("4").takes_value(true))
         )
         .get_matches();
 
@@ -228,7 +228,7 @@ fn main() {
             query_index.print_stats();
         }
         
-        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file, io_threads, io_buffer,32);
+        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file, io_threads, io_buffer,64);
     }
 }
 
