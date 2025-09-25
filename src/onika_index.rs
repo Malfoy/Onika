@@ -272,20 +272,24 @@ pub fn index_fasta_file(&mut self, filestr: &str) {
 
 
 
+pub fn index_file_of_files(&mut self, fof_path: &str) {
+    let reader = open_compressed_file(fof_path).expect("Could not open file of files");
+    let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+    let num_docs = files_to_process.len();
+    
+    self.num_docs = num_docs;
+    self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
 
-    pub fn index_file_of_files(&mut self, fof_path: &str) {
-        let reader = open_compressed_file(fof_path).expect("Could not open file of files");
-        let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-        let num_docs = files_to_process.len();
-        
-        self.num_docs = num_docs;
-        self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
+    let total_size = self.s as usize * num_docs;
+    self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
+    let data_arc = Arc::new(&self.intermediate_data);
 
-        let total_size = self.s as usize * num_docs;
-        self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
-        let data_arc = Arc::new(&self.intermediate_data);
-
-        files_to_process.into_par_iter().enumerate().for_each(|(i, filepath)| {
+    // --- CORRECTED SCHEDULER LOGIC ---
+    files_to_process
+        .into_iter()
+        .enumerate()  // 1. Enumerate the sequential iterator to get the index (i).
+        .par_bridge() // 2. Bridge the (index, filepath) tuples for load balancing.
+        .for_each(|(i, filepath)| {
             let seq_id = i as u32;
             let mut sketch = vec![self.mi as u64; self.s as usize];
             self.compute_sketch(SketchInput::FilePath(&filepath), &mut sketch);
@@ -302,7 +306,7 @@ pub fn index_fasta_file(&mut self, filestr: &str) {
                 }
             }
         });
-    }
+}
 
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
         sketch.fill(self.mi as u64);
@@ -314,7 +318,7 @@ pub fn index_fasta_file(&mut self, filestr: &str) {
                 if subseq.len() >= self.k as usize {
                     let h_iter = NtHashIterator::new(subseq, self.k as usize).unwrap();
                     for canon_hash in h_iter {
-                        let fp = revhash64(canon_hash);
+                        let fp = (canon_hash);
                         let bucket_id = (unrevhash64(canon_hash) >> (64 - self.ls)) as usize;
                         if bucket_id < sketch.len() {
                             if sketch[bucket_id] == self.mi as u64 {
