@@ -30,11 +30,13 @@ pub enum SketchMode {
     Perfect = 1,
 }
 
+/// Input for the compute_sketch function, allowing either a single sequence or a file path.
 pub enum SketchInput<'a> {
     Sequence(&'a [u8]),
     FilePath(&'a str),
 }
 
+/// Represents the source of the index data.
 pub enum IndexData {
     OnDisk {
         handle: Option<Arc<NamedTempFile>>,
@@ -43,6 +45,7 @@ pub enum IndexData {
     },
 }
 
+/// The final, immutable, lock-free index.
 pub struct Index {
     _ls: u32,
     _w: u32,
@@ -58,6 +61,7 @@ pub struct Index {
     is_compressed: bool,
 }
 
+/// A temporary, mutable struct for building the index in memory.
 pub struct IndexBuilder {
     ls: u32,
     w: u32,
@@ -272,7 +276,7 @@ impl IndexBuilder {
                 }
             });
     }
-    
+
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
         sketch.fill(self.mi as u64);
         let mut empty_cell = self.s;
@@ -413,10 +417,20 @@ impl Index {
         println!("Number of Genomes: {}", self.genome_numbers);
     }
 
-    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str, num_threads: usize, shard_zstd_level: i32) {
+    pub fn all_vs_all_comparison(
+        &self,
+        query_index: &Index,
+        threshold: f64,
+        is_matrix: bool,
+        zstd_level: i32,
+        output_file: &str,
+        num_threads: usize,
+        shard_zstd_level: i32,
+        temp_dir_path: Option<&str>,
+    ) {
         if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
             if soft_limit < hard_limit {
-                // println!("Attempting to increase open file limit from {} to {}.", soft_limit, hard_limit);
+                println!("Attempting to increase open file limit from {} to {}.", soft_limit, hard_limit);
                 if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, hard_limit) {
                     eprintln!("Warning: Failed to increase open file limit: {}. This may cause errors.", e);
                 }
@@ -439,7 +453,16 @@ impl Index {
         const LOCAL_BUFFER_FLUSH_THRESHOLD: usize = 1024;
 
         let mut writer = self.create_writer(output_file, zstd_level);
-        let temp_dir = TempBuilder::new().prefix("penta_comp_").tempdir().expect("Failed to create temporary directory");
+        
+        let temp_dir = match temp_dir_path {
+            Some(path) => {
+                fs::create_dir_all(path).expect("Failed to create specified temporary directory path");
+                TempBuilder::new().prefix("penta_comp_").tempdir_in(path)
+            }
+            None => TempBuilder::new().prefix("penta_comp_").tempdir(),
+        }
+        .expect("Failed to create temporary directory");
+
         println!("Using temporary directory for intermediate data: {:?}", temp_dir.path());
         if shard_zstd_level > 0 {
             println!("Using zstd level {} for temporary shard files.", shard_zstd_level);

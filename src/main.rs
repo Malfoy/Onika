@@ -9,6 +9,7 @@ extern crate needletail;
 extern crate byteorder;
 extern crate ahash;
 extern crate tempfile;
+extern crate num_cpus; // <-- Added this
 use jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -82,6 +83,12 @@ fn main() {
         .version("1.0")
         .author("Rust Translation")
         .about("A tool for MinHash sketching and all-versus-all comparison.")
+        .arg(Arg::with_name("threads")
+            .long("threads")
+            .global(true)
+            .help("Set the number of threads for parallel operations.")
+            .value_name("INT")
+            .takes_value(true))
         .subcommand(SubCommand::with_name("sketch")
             .about("Builds sketches from a dataset and saves them to a file.")
             .arg(Arg::with_name("input_fof").long("input-fof").value_name("FILE").help("Input dataset: a file of FASTA/Q file paths.").takes_value(true))
@@ -93,7 +100,6 @@ fn main() {
             .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
         )
@@ -116,19 +122,26 @@ fn main() {
             .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("threads").long("threads").value_name("INT").takes_value(true))
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
-            .arg(Arg::with_name("io_threads").long("io-threads").value_name("INT").default_value("16").takes_value(true))
-            .arg(Arg::with_name("io_buffer").long("io-buffer").value_name("INT").default_value("4").takes_value(true))
+            .arg(Arg::with_name("shard_zstd_level").long("shard-zstd-level").value_name("LEVEL").default_value("1").takes_value(true).help("Zstd level for temporary shard files (0 for none)."))
+            .arg(Arg::with_name("temp_dir").long("temp-dir").value_name("PATH").takes_value(true).help("Directory for temporary files."))
         )
         .get_matches();
+
+    // Initialize the global thread pool ONCE at the start.
+    // Use num_cpus::get() as the default to avoid initializing the pool too early.
+    let threads = value_t!(matches, "threads", usize)
+        .unwrap_or_else(|_| num_cpus::get());
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .unwrap();
 
     if let Some(matches) = matches.subcommand_matches("sketch") {
         let w = value_t!(matches, "w", u32).unwrap_or(16);
         let s = value_t!(matches, "s", u32).unwrap_or(16);
         let k = value_t!(matches, "k", u32).unwrap_or(31);
-        let threads = value_t!(matches, "threads", usize).unwrap_or(32);
         let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
@@ -144,8 +157,6 @@ fn main() {
         } else {
             value_t!(matches, "e", u32).unwrap_or(5_000_000)
         };
-
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
         
         println!("--- Building Sketch Index ---");
         let start_time = Instant::now();
@@ -157,7 +168,7 @@ fn main() {
             builder.index_fasta_file(fasta_file);
         }
         
-        let index = builder.into_final_index("tmp_onika",compress, zstd_level).expect("Failed to finalize index.");
+        let index = builder.into_final_index(output_file, compress, zstd_level).expect("Failed to finalize index.");
         println!("Sketching took {} seconds.", start_time.elapsed().as_secs());
         
         println!("Dumping sketch index to file: {}", output_file);
@@ -166,12 +177,13 @@ fn main() {
         }
 
     } else if let Some(matches) = matches.subcommand_matches("compare") {
-        let threads = value_t!(matches, "threads", usize).unwrap_or(32);
         let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
         let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
+        let shard_zstd_level = value_t!(matches, "shard_zstd_level", i32).unwrap_or(1);
+        let temp_dir_path = matches.value_of("temp_dir");
         let output_file = matches.value_of("output").unwrap();
         let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
         let is_matrix = matches.is_present("matrix");
@@ -187,8 +199,6 @@ fn main() {
         } else {
             value_t!(matches, "e", u32).unwrap_or(5_000_000)
         };
-
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
         
         let ref_index = if let Some(sketch_file) = matches.value_of("ref_sketch") {
             Index::from_file(sketch_file).expect("Failed to load reference sketch file")
@@ -201,7 +211,7 @@ fn main() {
             } else if let Some(fasta_file) = matches.value_of("ref_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index("tmp_onika",compress, zstd_level).expect("Failed to finalize reference index.");
+            let index = builder.into_final_index(output_file, compress, zstd_level).expect("Failed to finalize reference index.");
             println!("Reference indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
@@ -217,7 +227,7 @@ fn main() {
             } else if let Some(fasta_file) = matches.value_of("query_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index("tmp_onika",compress, zstd_level).expect("Failed to finalize query index.");
+            let index = builder.into_final_index(output_file, compress, zstd_level).expect("Failed to finalize query index.");
             println!("Query indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
@@ -229,7 +239,15 @@ fn main() {
             query_index.print_stats();
         }
         
-        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file,32,1);
+        ref_index.all_vs_all_comparison(
+            &query_index,
+            threshold,
+            is_matrix,
+            zstd_level,
+            output_file,
+            threads,
+            shard_zstd_level,
+            temp_dir_path,
+        );
     }
 }
-
