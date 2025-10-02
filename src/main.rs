@@ -176,8 +176,6 @@ fn main() {
         let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
         let is_matrix = matches.is_present("matrix");
         let compress = !matches.is_present("no_compress");
-        let io_threads = value_t!(matches, "io_threads", usize).unwrap_or(16);
-        let io_buffer = value_t!(matches, "io_buffer", usize).unwrap_or(16);
         
         let w = value_t!(matches, "w", u32).unwrap_or(16);
         let s = value_t!(matches, "s", u32).unwrap_or(16);
@@ -231,7 +229,7 @@ fn main() {
             query_index.print_stats();
         }
         
-        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file, io_threads, io_buffer,64);
+        ref_index.all_vs_all_comparison(&query_index, threshold, is_matrix, zstd_level, output_file,32,1);
     }
 }
 

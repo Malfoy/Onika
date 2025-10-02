@@ -1,31 +1,25 @@
 use crate::utils::*;
-use ahash::AHashMap;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use flate2::read::GzDecoder;
 use io::BufWriter;
-use needletail::parse_fastx_reader;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
-use std::ffi::OsStr;
+use rlimit;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc, Mutex,
+    atomic::{AtomicU32, AtomicU64, Ordering},
+    Arc, Mutex,
 };
-use std::thread;
-use itertools::Itertools;
-use niffler;
-
-
+use tempfile::Builder as TempBuilder;
+use std::fs;
 use f128::f128;
 use std::fmt::Write as FmtWrite;
-use stream_vbyte::{decode::decode, scalar::Scalar};
 use tempfile::NamedTempFile;
-use zstd::stream::write::Encoder as ZstdEncoder;
+use zstd::stream::{write::Encoder as ZstdEncoder, read::Decoder as ZstdDecoder};
 
 type Gid = u32;
 
@@ -36,15 +30,12 @@ pub enum SketchMode {
     Perfect = 1,
 }
 
-/// Input for the compute_sketch function, allowing either a single sequence or a file path.
 pub enum SketchInput<'a> {
     Sequence(&'a [u8]),
     FilePath(&'a str),
 }
 
-/// Represents the source of the index data, either fully in memory or on disk.
 pub enum IndexData {
-    InMemory(Vec<Vec<(u32, Vec<u8>)>>),
     OnDisk {
         handle: Option<Arc<NamedTempFile>>,
         path: String,
@@ -52,23 +43,21 @@ pub enum IndexData {
     },
 }
 
-/// The final, immutable, lock-free index. It contains `s` inverted indexes, one for each sketch position.
 pub struct Index {
-    ls: u32,
-    w: u32,
-    k: u32,
-    e: u32,
+    _ls: u32,
+    _w: u32,
+    _k: u32,
+    _e: u32,
     s: u64,
     sketch_size: u64,
     fingerprint_range: u64,
-    mi: u64,
+    _mi: u64,
     data: IndexData,
     genome_numbers: u64,
-    sketch_mode: SketchMode,
+    _sketch_mode: SketchMode,
     is_compressed: bool,
 }
 
-/// A temporary, mutable struct for building the index in memory.
 pub struct IndexBuilder {
     ls: u32,
     w: u32,
@@ -78,10 +67,8 @@ pub struct IndexBuilder {
     sketch_size: u64,
     fingerprint_range: u64,
     mi: u32,
-    // A single, flat vector representing a 2D matrix (pos x doc_id).
     intermediate_data: Vec<AtomicU32>,
-    // Store num_docs to know the matrix width.
-    num_docs: usize, 
+    num_docs: usize,
     genome_numbers: AtomicU64,
     empty_sketches_count: AtomicU64,
     sketch_mode: SketchMode,
@@ -90,50 +77,33 @@ pub struct IndexBuilder {
 pub(crate) fn open_compressed_file(path: &str) -> io::Result<Box<dyn BufRead + Send>> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-
-    // Peek at the first few bytes of the file to identify the compression format.
     let magic_bytes = reader.fill_buf()?;
 
     if magic_bytes.starts_with(&[0x1f, 0x8b]) {
-        // Gzip magic bytes: 1f 8b
-        // We must create a new BufReader because GzDecoder consumes the original.
         let file = File::open(path)?;
         Ok(Box::new(BufReader::new(GzDecoder::new(file))))
     } else if magic_bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
-        // Zstandard magic bytes: 28 b5 2f fd
         let file = File::open(path)?;
         let decoder = zstd::stream::read::Decoder::new(file)?;
         Ok(Box::new(BufReader::new(decoder)))
     } else {
-        // Not compressed or unknown, treat as plain text.
         Ok(Box::new(reader))
     }
 }
 
 impl IndexBuilder {
-    /// Creates a new IndexBuilder for in-memory construction.
     pub fn new(ils: u32, ik: u32, iw: u32, ie: u32, mode: SketchMode) -> Self {
         let s = 1u64 << ils;
         let fingerprint_range = 1u64 << iw;
 
         Self {
-            ls: ils,
-            w: iw,
-            k: ik,
-            e: ie,
-            s,
-            sketch_size: s,
-            fingerprint_range,
-            mi: u32::MAX,
-            intermediate_data: Vec::new(),
-            num_docs: 0,
-            genome_numbers: AtomicU64::new(0),
-            empty_sketches_count: AtomicU64::new(0),
+            ls: ils, w: iw, k: ik, e: ie, s, sketch_size: s, fingerprint_range,
+            mi: u32::MAX, intermediate_data: Vec::new(), num_docs: 0,
+            genome_numbers: AtomicU64::new(0), empty_sketches_count: AtomicU64::new(0),
             sketch_mode: mode,
         }
     }
 
-    /// Finalizes the index construction by building inverted indexes from the fingerprint lists.
     pub fn into_final_index(self, output_path: &str, compress: bool, zstd_level: i32) -> io::Result<Index> {
         println!("Building inverted indexes from fingerprint lists (in parallel)...");
         
@@ -144,11 +114,11 @@ impl IndexBuilder {
         let position_buffers: Vec<Vec<u8>> = self.intermediate_data
             .par_chunks(self.num_docs)
             .map(|fingerprint_chunk| {
-                let mut inverted_index: Vec<Vec<u32>> = vec![Vec::new(); self.fingerprint_range as usize];
+                let mut inverted_index: Vec<Vec<Gid>> = vec![Vec::new(); self.fingerprint_range as usize];
                 for (doc_id, fp_atomic) in fingerprint_chunk.iter().enumerate() {
                     let fp = fp_atomic.load(Ordering::Relaxed);
                     if fp != self.mi {
-                        inverted_index[fp as usize].push(doc_id as u32);
+                        inverted_index[fp as usize].push(doc_id as Gid);
                     }
                 }
                 
@@ -164,7 +134,7 @@ impl IndexBuilder {
                             prev = current;
                         }
                         let mut encoded_data = vec![0; 5 * gids.len()];
-                        let encoded_len = stream_vbyte::encode::encode::<Scalar>(&gids, &mut encoded_data);
+                        let encoded_len = stream_vbyte::encode::encode::<stream_vbyte::scalar::Scalar>(&gids, &mut encoded_data);
                         encoded_data.truncate(encoded_len);
                         encoded_data
                     } else {
@@ -221,30 +191,18 @@ impl IndexBuilder {
         let (file_handle, path) = temp_file.into_parts();
         
         Ok(Index {
-            ls: self.ls,
-            w: self.w,
-            k: self.k,
-            e: self.e,
-            s: self.s,
-            sketch_size: self.sketch_size,
-            fingerprint_range: self.fingerprint_range,
-            mi: self.mi as u64,
+            _ls: self.ls, _w: self.w, _k: self.k, _e: self.e, s: self.s,
+            sketch_size: self.sketch_size, fingerprint_range: self.fingerprint_range,
+            _mi: self.mi as u64,
             data: IndexData::OnDisk { handle: Some(Arc::new(NamedTempFile::from_parts(file_handle, path))), path: path_str, toc },
             genome_numbers: self.genome_numbers.load(Ordering::Relaxed),
-            sketch_mode: self.sketch_mode,
-            is_compressed: compress,
+            _sketch_mode: self.sketch_mode, is_compressed: compress,
         })
     }
 
-
-
-
-pub fn index_fasta_file(&mut self, filestr: &str) {
+    pub fn index_fasta_file(&mut self, filestr: &str) {
         let reader = open_compressed_file(filestr).expect("Could not open FASTA/FASTQ file");
-        let mut fastx_reader =
-            needletail::parse_fastx_reader(reader).expect("Invalid FASTA/FASTQ format");
-
-        // Use a simple loop to collect sequences, which is the correct pattern.
+        let mut fastx_reader = needletail::parse_fastx_reader(reader).expect("Invalid FASTA/FASTQ format");
         let mut sequences = Vec::new();
         while let Some(record) = fastx_reader.next() {
             let seqrec = record.expect("Invalid record in FASTA/FASTQ file");
@@ -254,15 +212,12 @@ pub fn index_fasta_file(&mut self, filestr: &str) {
         let num_docs = sequences.len();
         self.num_docs = num_docs;
         self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
-        
         let total_size = self.s as usize * num_docs;
         self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
-        
-        // This can now be safely shared across threads.
         let data_arc = Arc::new(&self.intermediate_data);
 
         sequences.into_par_iter().enumerate().for_each(|(i, seq)| {
-            let seq_id = i as u32;
+            let seq_id = i as Gid;
             let mut sketch = vec![self.mi as u64; self.s as usize];
             self.compute_sketch(SketchInput::Sequence(&seq), &mut sketch);
 
@@ -280,63 +235,54 @@ pub fn index_fasta_file(&mut self, filestr: &str) {
         });
     }
 
+    pub fn index_file_of_files(&mut self, fof_path: &str) {
+        let reader = open_compressed_file(fof_path).expect("Could not open file of files");
+        let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
+        let num_docs = files_to_process.len();
+        
+        self.num_docs = num_docs;
+        self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
+        let total_size = self.s as usize * num_docs;
+        self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
+        let data_arc = Arc::new(&self.intermediate_data);
+        const CHUNK_SIZE: usize = 32;
 
-pub fn index_file_of_files(&mut self, fof_path: &str) {
-    let reader = open_compressed_file(fof_path).expect("Could not open file of files");
-    let files_to_process: Vec<String> = reader.lines().filter_map(Result::ok).collect();
-    let num_docs = files_to_process.len();
-    
-    self.num_docs = num_docs;
-    self.genome_numbers.store(num_docs as u64, Ordering::SeqCst);
+        files_to_process
+            .par_chunks(CHUNK_SIZE)
+            .enumerate()
+            .for_each(|(chunk_index, file_chunk)| {
+                let base_index = chunk_index * CHUNK_SIZE;
+                for (i_in_chunk, filepath) in file_chunk.iter().enumerate() {
+                    let i = base_index + i_in_chunk;
+                    let seq_id = i as Gid;
+                    let mut sketch = vec![self.mi as u64; self.s as usize];
+                    self.compute_sketch(SketchInput::FilePath(filepath), &mut sketch);
 
-    let total_size = self.s as usize * num_docs;
-    self.intermediate_data.resize_with(total_size, || AtomicU32::new(self.mi));
-    let data_arc = Arc::new(&self.intermediate_data);
+                    if sketch.iter().all(|&x| x == self.mi as u64) {
+                        self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
 
-    // A tunable parameter. A value between 16 and 64 is often a good start.
-    const CHUNK_SIZE: usize = 32;
-
-    // --- CORRECTED SCHEDULER LOGIC ---
-    // Use Rayon's native `par_chunks` for efficient, balanced parallel processing.
-    files_to_process
-        .par_chunks(CHUNK_SIZE)
-        .enumerate() // This gives us the index of the chunk, not the item.
-        .for_each(|(chunk_index, file_chunk)| {
-            // We calculate the original index of each file manually.
-            let base_index = chunk_index * CHUNK_SIZE;
-
-            for (i_in_chunk, filepath) in file_chunk.iter().enumerate() {
-                let i = base_index + i_in_chunk;
-                let seq_id = i as u32;
-                
-                let mut sketch = vec![self.mi as u64; self.s as usize];
-                self.compute_sketch(SketchInput::FilePath(filepath), &mut sketch);
-
-                if sketch.iter().all(|&x| x == self.mi as u64) {
-                    self.empty_sketches_count.fetch_add(1, Ordering::Relaxed);
-                    continue; // Continue to the next file in the chunk
-                }
-
-                for (pos, &fp) in sketch.iter().enumerate() {
-                    if fp < self.fingerprint_range {
-                        let index = pos * num_docs + (seq_id as usize);
-                        data_arc[index].store(fp as u32, Ordering::Relaxed);
+                    for (pos, &fp) in sketch.iter().enumerate() {
+                        if fp < self.fingerprint_range {
+                            let index = pos * num_docs + (seq_id as usize);
+                            data_arc[index].store(fp as u32, Ordering::Relaxed);
+                        }
                     }
                 }
-            }
-        });
-}
+            });
+    }
+    
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
         sketch.fill(self.mi as u64);
         let mut empty_cell = self.s;
         let is_valid_dna = |c: &u8| matches!(*c, b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't');
-
         let mut update_sketch = |sequence: &[u8]| {
             for subseq in sequence.split(|c| !is_valid_dna(c)) {
                 if subseq.len() >= self.k as usize {
                     let h_iter = NtHashIterator::new(subseq, self.k as usize).unwrap();
                     for canon_hash in h_iter {
-                        let fp = (canon_hash);
+                        let fp = canon_hash;
                         let bucket_id = (unrevhash64(canon_hash) >> (64 - self.ls)) as usize;
                         if bucket_id < sketch.len() {
                             if sketch[bucket_id] == self.mi as u64 {
@@ -354,15 +300,12 @@ pub fn index_file_of_files(&mut self, fof_path: &str) {
         match input {
             SketchInput::Sequence(seq) => update_sketch(seq),
             SketchInput::FilePath(path) => {
-                match open_compressed_file(path) {
-                    Ok(reader) => {
-                        if let Ok(mut file_reader) = needletail::parse_fastx_reader(reader) {
-                            while let Some(Ok(record)) = file_reader.next() {
-                                update_sketch(&record.seq());
-                            }
+                if let Ok(reader) = open_compressed_file(path) {
+                    if let Ok(mut file_reader) = needletail::parse_fastx_reader(reader) {
+                        while let Some(Ok(record)) = file_reader.next() {
+                            update_sketch(&record.seq());
                         }
                     }
-                    Err(e) => eprintln!("Warning: could not open file {}: {}", path, e),
                 }
             }
         }
@@ -430,10 +373,7 @@ impl Index {
         let e = file.read_u32::<LittleEndian>()?;
         let fingerprint_range = file.read_u64::<LittleEndian>()?;
         let genome_numbers = file.read_u64::<LittleEndian>()?;
-        let sketch_mode = match file.read_u8()? {
-            1 => SketchMode::Perfect,
-            _ => SketchMode::Default,
-        };
+        let sketch_mode = match file.read_u8()? { 1 => SketchMode::Perfect, _ => SketchMode::Default };
         let is_compressed = file.read_u8()? != 0;
         let s = 1u64 << ls;
 
@@ -444,91 +384,122 @@ impl Index {
 
         println!("Finished loading index metadata.");
         Ok(Self {
-            ls, w, k, e, s, sketch_size: s, fingerprint_range, mi: u64::MAX,
+            _ls: ls, _w: w, _k: k, _e: e, s, sketch_size: s, fingerprint_range, _mi: u64::MAX,
             data: IndexData::OnDisk { handle: None, path: filestr.to_string(), toc },
-            genome_numbers, sketch_mode, is_compressed,
+            genome_numbers, _sketch_mode: sketch_mode, is_compressed,
         })
     }
 
     pub fn dump_index_disk(self, filestr: &str) -> io::Result<()> {
-        match self.data {
-            IndexData::OnDisk{ handle, path, ..} => {
-                if let Some(temp_handle) = handle {
-                    match Arc::try_unwrap(temp_handle) {
-                        Ok(temp_file) => { temp_file.persist(filestr)?; },
-                        Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "Failed to unwrap Arc for temp file")),
-                    }
-                } else {
-                    std::fs::copy(&path, filestr)?;
-                }
-            },
-            IndexData::InMemory(_) => {
-                panic!("dump_index_disk called on an in-memory index, which is not supported by the new design.");
+        let IndexData::OnDisk { handle, path, .. } = self.data;
+        if let Some(temp_handle) = handle {
+            if let Ok(temp_file) = Arc::try_unwrap(temp_handle) {
+                temp_file.persist(filestr)?;
+            } else {
+                return Err(io::Error::new(io::ErrorKind::Other, "Failed to unwrap Arc for temp file"));
             }
+        } else {
+            std::fs::copy(&path, filestr)?;
         }
         Ok(())
     }
 
     pub fn print_stats(&self) {
-        if let IndexData::InMemory(data) = &self.data {
-            println!("\nINDEX STATISTICS (In-Memory)");
-            println!("=========================================================");
-
-            let sizes: Vec<u64> = data
-                .par_iter()
-                .flat_map(|pos_index| pos_index.par_iter().map(|(count, _)| *count as u64))
-                .filter(|&size| size > 0)
-                .collect();
-
-            if sizes.is_empty() { println!("Index is empty."); return; }
-            let num_lists = sizes.len() as f64;
-            let sum: u64 = sizes.iter().sum();
-            let mean = sum as f64 / num_lists;
-            let min_size = *sizes.iter().min().unwrap_or(&0);
-            let max_size = *sizes.iter().max().unwrap_or(&0);
-
-            println!("Number of non-empty lists: {}", sizes.len());
-            println!("Total elements in index: {}", sum);
-            println!("Min list size: {}", min_size);
-            println!("Max list size: {}", max_size);
-            println!("Mean list size: {:.4}", mean);
-            println!("Index is compressed: {}", self.is_compressed);
-        } else {
-            println!("\nINDEX STATISTICS (On-Disk)");
-            println!("=========================================================");
-            println!("Statistics are not computed for on-disk indexes to avoid slow file reads.");
-            println!("Sketch Size (s): {}", self.sketch_size);
-            println!("Fingerprint Range (2^w): {}", self.fingerprint_range);
-            println!("Number of Genomes: {}", self.genome_numbers);
-        }
+        println!("\nINDEX STATISTICS (On-Disk)");
+        println!("=========================================================");
+        println!("Statistics are not computed for on-disk indexes to avoid slow file reads.");
+        println!("Sketch Size (s): {}", self.sketch_size);
+        println!("Fingerprint Range (2^w): {}", self.fingerprint_range);
+        println!("Number of Genomes: {}", self.genome_numbers);
     }
-    
-    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str, num_io_threads: usize, io_buffer_size: usize, num_compute_threads: usize) {
-        println!("\n--- Starting All-Versus-All Comparison ---");
+
+    pub fn all_vs_all_comparison(&self, query_index: &Index, threshold: f64, is_matrix: bool, zstd_level: i32, output_file: &str, num_threads: usize, shard_zstd_level: i32) {
+        if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
+            if soft_limit < hard_limit {
+                // println!("Attempting to increase open file limit from {} to {}.", soft_limit, hard_limit);
+                if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, hard_limit) {
+                    eprintln!("Warning: Failed to increase open file limit: {}. This may cause errors.", e);
+                }
+            }
+        }
+
+        println!("\n--- Starting All-Versus-All Comparison (Low Memory Mode, Single Pass) ---");
         let start_time = std::time::Instant::now();
 
         let num_queries = query_index.genome_numbers as usize;
         let num_refs = self.genome_numbers as usize;
 
         let min_required_score = if threshold > 0.0 { (threshold * self.s as f64).ceil() as u32 } else { 0 };
-        let perform_pruning = min_required_score > 1;
-        if perform_pruning { println!("Similarity threshold of {} requires at least {} shared fingerprints. Applying pruning.", threshold, min_required_score); }
+        if min_required_score > 1 {
+            println!("Similarity threshold of {} requires at least {} shared fingerprints.", threshold, min_required_score);
+        }
 
-        let num_shards = 1024;
-        let scores_shards: Vec<Mutex<AHashMap<(u32, u32), u32>>> =
-            (0..num_shards).map(|_| Mutex::new(AHashMap::default())).collect();
+        const NUM_SHARDS: usize = 2048;
+        const SHARD_BUFFER_SIZE: usize = 256 * 1024;
+        const LOCAL_BUFFER_FLUSH_THRESHOLD: usize = 1024;
 
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(num_compute_threads)
-            .build()
-            .unwrap();
+        let mut writer = self.create_writer(output_file, zstd_level);
+        let temp_dir = TempBuilder::new().prefix("penta_comp_").tempdir().expect("Failed to create temporary directory");
+        println!("Using temporary directory for intermediate data: {:?}", temp_dir.path());
+        if shard_zstd_level > 0 {
+            println!("Using zstd level {} for temporary shard files.", shard_zstd_level);
+        }
 
-        pool.install(|| {
-            if let (IndexData::InMemory(ref_data), IndexData::InMemory(query_data)) = (&self.data, &query_index.data) {
-                (0..self.sketch_size as usize).into_par_iter().for_each(|pos| {
-                    let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
-                    let ref_pos_index = &ref_data[pos];
-                    let query_pos_index = &query_data[pos];
+        enum ShardWriter {
+            Uncompressed(BufWriter<File>),
+            Compressed(ZstdEncoder<'static, BufWriter<File>>),
+        }
+
+        impl io::Write for ShardWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                match self {
+                    ShardWriter::Uncompressed(writer) => writer.write(buf),
+                    ShardWriter::Compressed(encoder) => encoder.write(buf),
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                match self {
+                    ShardWriter::Uncompressed(writer) => writer.flush(),
+                    ShardWriter::Compressed(encoder) => encoder.flush(),
+                }
+            }
+        }
+
+        let mut shard_paths = Vec::with_capacity(NUM_SHARDS);
+        let shard_writers: Vec<Mutex<ShardWriter>> = (0..NUM_SHARDS).map(|i| {
+            let path = if shard_zstd_level > 0 {
+                temp_dir.path().join(format!("shard_{}.bin.zst", i))
+            } else {
+                temp_dir.path().join(format!("shard_{}.bin", i))
+            };
+            let file = File::create(&path).expect("Failed to create shard file.");
+            shard_paths.push(path);
+            let writer = BufWriter::with_capacity(SHARD_BUFFER_SIZE, file);
+            let shard_writer = if shard_zstd_level > 0 {
+                let encoder = ZstdEncoder::new(writer, shard_zstd_level).expect("Failed to create zstd encoder");
+                ShardWriter::Compressed(encoder)
+            } else {
+                ShardWriter::Uncompressed(writer)
+            };
+            Mutex::new(shard_writer)
+        }).collect();
+
+        let pool = ThreadPoolBuilder::new().num_threads(num_threads).build().unwrap();
+
+        let remaining_buffers: Vec<Vec<Vec<u64>>> = pool.install(|| {
+            let num_pos = self.sketch_size as usize;
+            let chunk_size = (num_pos + num_threads - 1) / num_threads;
+            let pos_iterator: Vec<usize> = (0..num_pos).collect();
+            let pos_chunks: Vec<&[usize]> = pos_iterator.chunks(chunk_size).collect();
+
+            pos_chunks.into_par_iter().map(|pos_chunk| {
+                let mut ref_file = File::open(&self.path_for_reading()).expect("Cannot open reference index file in thread.");
+                let mut query_file = File::open(&query_index.path_for_reading()).expect("Cannot open query index file in thread.");
+                let mut local_shard_buffers: Vec<Vec<u64>> = vec![Vec::new(); NUM_SHARDS];
+
+                for &pos in pos_chunk {
+                    let ref_pos_index = read_pos_from_file(&mut ref_file, &self.toc_for_reading(), pos, self.fingerprint_range);
+                    let query_pos_index = read_pos_from_file(&mut query_file, &query_index.toc_for_reading(), pos, query_index.fingerprint_range);
 
                     for fp in 0..self.fingerprint_range as usize {
                         let (ref_count, ref_bytes) = &ref_pos_index[fp];
@@ -538,153 +509,163 @@ impl Index {
                                 let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
                                 let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
                                 for &query_gid in &query_gids {
+                                    let shard_index = revhash64(query_gid as u64) as usize % NUM_SHARDS;
                                     for &ref_gid in &ref_gids {
-                                        let key = (query_gid, ref_gid);
-                                        let shard_index = key.0 as usize % num_shards;
-                                        let mut shard = scores_shards[shard_index].lock().unwrap();
-                                        if !perform_pruning {
-                                            *shard.entry(key).or_insert(0) += 1;
-                                        } else if let Some(score) = shard.get_mut(&key) {
-                                            *score += 1;
-                                            if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
-                                        } else if 1 + remaining_hits_possible >= min_required_score as u64 {
-                                            shard.insert(key, 1);
-                                        }
+                                        let key = (query_gid as u64) << 32 | (ref_gid as u64);
+                                        local_shard_buffers[shard_index].push(key);
                                     }
                                 }
                             }
                         }
                     }
-                });
-            } else {
-                type PosData = (usize, Vec<(u32, Vec<u8>)>, Vec<(u32, Vec<u8>)>);
-                let (tx, rx) = mpsc::sync_channel::<PosData>(io_buffer_size);
-                
-                let position_counter = Arc::new(AtomicUsize::new(0));
-                let mut producer_handles = Vec::new();
 
-                for _ in 0..num_io_threads {
-                    let tx_clone = tx.clone();
-                    let ref_path = self.path_for_reading().to_string();
-                    let query_path = query_index.path_for_reading().to_string();
-                    let ref_toc = self.toc_for_reading().to_vec();
-                    let query_toc = query_index.toc_for_reading().to_vec();
-                    let s = self.s;
-                    let fp_range = self.fingerprint_range;
-                    let counter_clone = Arc::clone(&position_counter);
-
-                    producer_handles.push(thread::spawn(move || {
-                        let mut ref_file = File::open(ref_path).expect("Cannot open reference index file in producer.");
-                        let mut query_file = File::open(query_path).expect("Cannot open query index file in producer.");
-                        loop {
-                            let pos = counter_clone.fetch_add(1, Ordering::SeqCst);
-                            if pos >= s as usize { break; }
-
-                            let ref_pos_data = read_pos_from_file(&mut ref_file, &ref_toc, pos, fp_range);
-                            let query_pos_data = read_pos_from_file(&mut query_file, &query_toc, pos, fp_range);
-                            if tx_clone.send((pos, ref_pos_data, query_pos_data)).is_err() { break; }
-                        }
-                    }));
-                }
-                drop(tx);
-
-                rx.into_iter().par_bridge().for_each(|(pos, ref_pos_index, query_pos_index)| {
-                    let remaining_hits_possible = self.sketch_size - pos as u64 - 1;
-                    (0..self.fingerprint_range as usize).into_par_iter().for_each(|fp| {
-                        let (ref_count, ref_bytes) = &ref_pos_index[fp];
-                        if *ref_count > 0 {
-                            let (query_count, query_bytes) = &query_pos_index[fp];
-                            if *query_count > 0 {
-                                let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
-                                let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
-                                for &query_gid in &query_gids {
-                                    for &ref_gid in &ref_gids {
-                                        let key = (query_gid, ref_gid);
-                                        let shard_index = key.0 as usize % num_shards;
-                                        let mut shard = scores_shards[shard_index].lock().unwrap();
-                                        if !perform_pruning {
-                                            *shard.entry(key).or_insert(0) += 1;
-                                        } else if let Some(score) = shard.get_mut(&key) {
-                                            *score += 1;
-                                            if *score as u64 + remaining_hits_possible < min_required_score as u64 { shard.remove(&key); }
-                                        } else if 1 + remaining_hits_possible >= min_required_score as u64 {
-                                            shard.insert(key, 1);
-                                        }
-                                    }
+                    for (shard_index, buffer) in local_shard_buffers.iter_mut().enumerate() {
+                        if buffer.len() >= LOCAL_BUFFER_FLUSH_THRESHOLD {
+                            if let Ok(mut writer_lock) = shard_writers[shard_index].try_lock() {
+                                for &key in buffer.iter() {
+                                    writer_lock.write_u64::<LittleEndian>(key).unwrap();
                                 }
+                                buffer.clear();
                             }
                         }
-                    });
-                });
-
-                for handle in producer_handles {
-                    handle.join().unwrap();
+                    }
+                }
+                local_shard_buffers
+            }).collect()
+        });
+        
+        println!("Flushing remaining thread buffers in parallel...");
+        (0..NUM_SHARDS).into_par_iter().for_each(|shard_index| {
+            let mut writer_lock = shard_writers[shard_index].lock().unwrap();
+            for thread_buffers in &remaining_buffers {
+                let buffer = &thread_buffers[shard_index];
+                if !buffer.is_empty() {
+                    for &key in buffer {
+                        writer_lock.write_u64::<LittleEndian>(key).unwrap();
+                    }
                 }
             }
         });
-        
-        println!("Score calculation finished in {} seconds. Aggregating and formatting results...", start_time.elapsed().as_secs());
 
-        let mut scores_by_query: Vec<Vec<(Gid, u32)>> = vec![Vec::new(); num_queries];
-        for shard_mutex in scores_shards {
-            let shard_map = shard_mutex.into_inner().unwrap();
-            for ((query_gid, ref_gid), count) in shard_map {
-                if count >= min_required_score && (query_gid as usize) < num_queries {
-                    scores_by_query[query_gid as usize].push((ref_gid, count));
-                }
+        for writer_mutex in shard_writers {
+            let shard_writer = writer_mutex.into_inner().expect("Mutex lock failed");
+            match shard_writer {
+                ShardWriter::Uncompressed(mut writer) => writer.flush().expect("Failed to flush writer"),
+                ShardWriter::Compressed(encoder) => { encoder.finish().expect("Failed to finish zstd stream"); },
             }
         }
+
+        let aggregation_start_time = std::time::Instant::now();
+
+        let aggregated_pairs: Vec<Vec<(u64, u32)>> = shard_paths.into_par_iter().filter_map(|path| {
+            let file = File::open(&path).ok()?;
+            if file.metadata().ok()?.len() == 0 { fs::remove_file(&path).ok(); return None; }
+
+            let mut reader: Box<dyn Read> = if shard_zstd_level > 0 {
+                Box::new(ZstdDecoder::new(file).ok()?)
+            } else {
+                Box::new(BufReader::new(file))
+            };
+
+            let mut all_bytes = Vec::new();
+            reader.read_to_end(&mut all_bytes).ok()?;
+            
+            let mut keys = Vec::new();
+            let mut cursor = io::Cursor::new(all_bytes);
+            while let Ok(key) = cursor.read_u64::<LittleEndian>() { keys.push(key); }
+
+            keys.par_sort_unstable();
+
+            let mut results_for_shard = Vec::new();
+            if keys.is_empty() { fs::remove_file(&path).ok(); return Some(results_for_shard); }
+
+            let mut it = keys.into_iter();
+            let mut current_key = it.next().unwrap();
+            let mut count = 1;
+            for key in it {
+                if key == current_key {
+                    count += 1;
+                } else {
+                    if count >= min_required_score { results_for_shard.push((current_key, count)); }
+                    current_key = key;
+                    count = 1;
+                }
+            }
+            if count >= min_required_score { results_for_shard.push((current_key, count)); }
+            
+            fs::remove_file(&path).ok();
+            Some(results_for_shard)
+        }).collect();
         
-        println!("Parallel formatting of results...");
-        let output_lines: Vec<String> = (0..num_queries).into_par_iter().map(|query_gid| {
+        let mut all_results: Vec<(u64, u32)> = aggregated_pairs.into_iter().flatten().collect();
+        
+        all_results.par_sort_unstable_by(|a, b| {
+            let a_query = a.0 >> 32;
+            let b_query = b.0 >> 32;
+            match a_query.cmp(&b_query) {
+                std::cmp::Ordering::Equal => b.1.cmp(&a.1),
+                other => other,
+            }
+        });
+
+        println!("Aggregation finished in {} seconds.", aggregation_start_time.elapsed().as_secs());
+        
+        let output_lines: Vec<String> = (0..num_queries).into_par_iter().map(|query_idx| {
+            let query_gid = query_idx as u64;
             let mut line = String::with_capacity(256);
             write!(&mut line, "query_{}\t", query_gid).unwrap();
-            let mut res = scores_by_query[query_gid].clone();
-            if is_matrix {
-                let mut full_row = vec![0.0; num_refs];
-                for &(ref_gid, count) in res.iter() {
-                    if (ref_gid as usize) < num_refs { full_row[ref_gid as usize] = count as f64 / self.s as f64; }
+
+            let start_idx = all_results.partition_point(|(key, _)| (*key >> 32) < query_gid);
+            let end_idx = all_results.partition_point(|(key, _)| (*key >> 32) <= query_gid);
+            let results_slice = &all_results[start_idx..end_idx];
+
+            if !results_slice.is_empty() {
+                if is_matrix {
+                    let mut full_row = vec![0.0; num_refs];
+                    for &(key, count) in results_slice {
+                        let ref_gid = key as Gid;
+                        if (ref_gid as usize) < num_refs {
+                             full_row[ref_gid as usize] = count as f64 / self.s as f64;
+                        }
+                    }
+                    line.push_str(&full_row.iter().map(|&sim| if sim >= threshold { format!("{:.4}", sim) } else { "0.0000".to_string() }).collect::<Vec<String>>().join(","));
+                } else {
+                    line.push_str(&results_slice.iter()
+                        .map(|(key, count)| format!("{}:{:.4}", *key as Gid, *count as f64 / self.s as f64))
+                        .collect::<Vec<String>>()
+                        .join(","));
                 }
-                line.push_str(&full_row.iter().map(|&sim| if sim >= threshold { format!("{:.4}", sim) } else { "0.0000".to_string() }).collect::<Vec<String>>().join(","));
-            } else {
-                res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                line.push_str(&res.iter().map(|(gid, count)| format!("{}:{:.4}", gid, *count as f64 / self.s as f64)).collect::<Vec<String>>().join(","));
+            } else if is_matrix {
+                let full_row = vec!["0.0000"; num_refs];
+                line.push_str(&full_row.join(","));
             }
             line
         }).collect();
-        
-        println!("Writing results to disk...");
-        let mut writer = self.create_writer(output_file, zstd_level);
+
         for line in output_lines { writeln!(writer, "{}", line).unwrap(); }
-
-        println!("All-vs-all comparison complete. Total time: {} seconds.", start_time.elapsed().as_secs());
+        
+        println!("\nAll-vs-all comparison complete. Total time: {} seconds.", start_time.elapsed().as_secs());
     }
-
+   
     fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
         let file = File::create(output_file).expect("Cannot create output file");
         if zstd_level > 0 { Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish()) } else { Box::new(BufWriter::new(file)) }
     }
 
     fn path_for_reading(&self) -> &str {
-        match &self.data {
-            IndexData::OnDisk { path, .. } => path,
-            IndexData::InMemory(_) => panic!("Cannot get file path for an in-memory index."),
-        }
+        let IndexData::OnDisk { path, .. } = &self.data;
+        path
     }
     
     fn toc_for_reading(&self) -> &[(u64, u64)] {
-        match &self.data {
-            IndexData::OnDisk { toc, .. } => toc,
-            IndexData::InMemory(_) => panic!("Cannot get TOC for an in-memory index."),
-        }
+        let IndexData::OnDisk { toc, .. } = &self.data;
+        toc
     }
 }
 
 fn read_pos_from_file(file: &mut File, toc: &[(u64, u64)], pos: usize, fp_range: u64) -> Vec<(u32, Vec<u8>)> {
     let (offset, len) = toc[pos];
-    if len == 0 { 
-        return vec![(0, Vec::new()); fp_range as usize];
-    }
+    if len == 0 { return vec![(0, Vec::new()); fp_range as usize]; }
     
     let mut compressed_buffer = vec![0; len as usize];
     file.seek(SeekFrom::Start(offset)).unwrap();
@@ -705,12 +686,11 @@ fn read_pos_from_file(file: &mut File, toc: &[(u64, u64)], pos: usize, fp_range:
     pos_index
 }
 
-/// Helper to decode a GID list from bytes depending on whether it's compressed.
-fn decode_gid_list(count: u32, bytes: &[u8], is_compressed: bool) -> Vec<u32> {
+fn decode_gid_list(count: u32, bytes: &[u8], is_compressed: bool) -> Vec<Gid> {
     if count == 0 { return Vec::new(); }
     if is_compressed {
-        let mut gids = vec![0u32; count as usize];
-        decode::<Scalar>(bytes, count as usize, &mut gids);
+        let mut gids = vec![0 as Gid; count as usize];
+        stream_vbyte::decode::decode::<stream_vbyte::scalar::Scalar>(bytes, count as usize, &mut gids);
         for j in 1..gids.len() { gids[j] = gids[j].wrapping_add(gids[j - 1]); }
         gids
     } else {
