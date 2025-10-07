@@ -428,11 +428,9 @@ pub fn all_vs_all_comparison(
         shard_zstd_level: i32,
         temp_dir_path: Option<&str>,
     ) {
-        const NUM_SHARDS: usize = 8192;
         if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
-            if soft_limit < NUM_SHARDS as u64 {
-                // println!("Attempting to increase open file limit from {} to {}.", soft_limit, NUM_SHARDS);
-                if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, NUM_SHARDS as u64) {
+            if soft_limit < hard_limit {
+                if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, hard_limit) {
                     eprintln!("Warning: Failed to increase open file limit: {}. This may cause errors.", e);
                 }
             }
@@ -449,7 +447,7 @@ pub fn all_vs_all_comparison(
             println!("Similarity threshold of {} requires at least {} shared fingerprints.", threshold, min_required_score);
         }
 
-        
+        const NUM_SHARDS: usize = 8192;
         const LOCAL_BUFFER_FLUSH_THRESHOLD: usize = 1024;
 
         let mut writer = self.create_writer(output_file, zstd_level);
