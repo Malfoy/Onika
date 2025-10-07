@@ -109,7 +109,6 @@ impl IndexBuilder {
     }
 
     pub fn into_final_index(self, output_path: &str, compress: bool, zstd_level: i32) -> io::Result<Index> {
-        println!("Building inverted indexes from fingerprint lists (in parallel)...");
         
         let output_dir = Path::new(output_path).parent().unwrap_or_else(|| Path::new("."));
         let temp_file = tempfile::Builder::new().prefix(".tmp-index-").tempfile_in(output_dir)?;
@@ -386,7 +385,6 @@ impl Index {
             toc.push((file.read_u64::<LittleEndian>()?, file.read_u64::<LittleEndian>()?));
         }
 
-        println!("Finished loading index metadata.");
         Ok(Self {
             _ls: ls, _w: w, _k: k, _e: e, s, sketch_size: s, fingerprint_range, _mi: u64::MAX,
             data: IndexData::OnDisk { handle: None, path: filestr.to_string(), toc },
@@ -436,19 +434,15 @@ pub fn all_vs_all_comparison(
             }
         }
 
-        println!("\n--- Starting All-Versus-All Comparison (Low Memory Mode, Single Pass) ---");
         let start_time = std::time::Instant::now();
 
         let num_queries = query_index.genome_numbers as usize;
         let num_refs = self.genome_numbers as usize;
 
         let min_required_score = if threshold > 0.0 { (threshold * self.s as f64).ceil() as u32 } else { 0 };
-        if min_required_score > 1 {
-            println!("Similarity threshold of {} requires at least {} shared fingerprints.", threshold, min_required_score);
-        }
 
         const NUM_SHARDS: usize = 8192;
-        const LOCAL_BUFFER_FLUSH_THRESHOLD: usize = 1024;
+        const LOCAL_BUFFER_FLUSH_THRESHOLD: usize = 1000;
 
         let mut writer = self.create_writer(output_file, zstd_level);
         
@@ -461,10 +455,6 @@ pub fn all_vs_all_comparison(
         }
         .expect("Failed to create temporary directory");
 
-        println!("Using temporary directory for intermediate data: {:?}", temp_dir.path());
-        if shard_zstd_level > 0 {
-            println!("Using zstd level {} for temporary shard files.", shard_zstd_level);
-        }
 
         enum ShardWriter {
             Uncompressed(BufWriter<File>),
@@ -542,12 +532,12 @@ pub fn all_vs_all_comparison(
 
                     for (shard_index, buffer) in local_shard_buffers.iter_mut().enumerate() {
                         if buffer.len() >= LOCAL_BUFFER_FLUSH_THRESHOLD {
-                            if let Ok(mut writer_lock) = shard_writers[shard_index].try_lock() {
-                                for &key in buffer.iter() {
-                                    writer_lock.write_u64::<LittleEndian>(key).unwrap();
-                                }
-                                buffer.clear();
+                            // Wait for the lock instead of just trying.
+                            let mut writer_lock = shard_writers[shard_index].lock().unwrap();
+                            for &key in buffer.iter() {
+                                writer_lock.write_u64::<LittleEndian>(key).unwrap();
                             }
+                            buffer.clear();
                         }
                     }
                 }
@@ -555,10 +545,7 @@ pub fn all_vs_all_comparison(
             }).collect()
         });
         
-        println!("Reorganizing and flushing remaining thread buffers...");
         
-        // Transpose the remaining buffers from a thread-major layout to a shard-major layout.
-        // This allows us to give ownership of all buffers for a specific shard to a single parallel task.
         let mut buffers_by_shard: Vec<Vec<Vec<u64>>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
         for thread_buffers in remaining_buffers.into_iter() {
             for (shard_index, shard_buffer) in thread_buffers.into_iter().enumerate() {
@@ -568,17 +555,13 @@ pub fn all_vs_all_comparison(
             }
         }
         
-        // Flush the reorganized buffers in parallel.
-        // By using into_par_iter(), each task gets ownership of the buffers for its assigned shard.
         buffers_by_shard.into_par_iter().enumerate().for_each(|(shard_index, buffers_for_this_shard)| {
             if !buffers_for_this_shard.is_empty() {
                 let mut writer_lock = shard_writers[shard_index].lock().unwrap();
-                // This inner loop takes ownership of each individual buffer.
                 for buffer in buffers_for_this_shard {
                     for &key in &buffer {
                         writer_lock.write_u64::<LittleEndian>(key).unwrap();
                     }
-                    // `buffer` goes out of scope here and its memory is deallocated.
                 }
             }
         });
@@ -591,7 +574,6 @@ pub fn all_vs_all_comparison(
             }
         }
 
-        let aggregation_start_time = std::time::Instant::now();
 
         let aggregated_pairs: Vec<Vec<(u64, u32)>> = shard_paths.into_par_iter().filter_map(|path| {
             let file = File::open(&path).ok()?;
@@ -644,45 +626,65 @@ pub fn all_vs_all_comparison(
             }
         });
 
-        println!("Aggregation finished in {} seconds.", aggregation_start_time.elapsed().as_secs());
-        
-        let output_lines: Vec<String> = (0..num_queries).into_par_iter().map(|query_idx| {
+        let mut results_iter = all_results.into_iter().peekable();
+
+        for query_idx in 0..num_queries {
             let query_gid = query_idx as u64;
-            let mut line = String::with_capacity(256);
+
+            let mut line = String::with_capacity(if is_matrix { num_refs * 8 } else { 512 });
             write!(&mut line, "query_{}\t", query_gid).unwrap();
 
-            let start_idx = all_results.partition_point(|(key, _)| (*key >> 32) < query_gid);
-            let end_idx = all_results.partition_point(|(key, _)| (*key >> 32) <= query_gid);
-            let results_slice = &all_results[start_idx..end_idx];
-
-            if !results_slice.is_empty() {
-                if is_matrix {
-                    let mut full_row = vec![0.0; num_refs];
-                    for &(key, count) in results_slice {
+            if is_matrix {
+                let mut full_row = vec![0.0; num_refs];
+                while let Some((key, _)) = results_iter.peek() {
+                    if (*key >> 32) == query_gid {
+                        let (key, count) = results_iter.next().unwrap();
                         let ref_gid = key as Gid;
                         if (ref_gid as usize) < num_refs {
-                             full_row[ref_gid as usize] = count as f64 / self.s as f64;
+                            full_row[ref_gid as usize] = count as f64 / self.s as f64;
                         }
+                    } else {
+                        break;
                     }
-                    line.push_str(&full_row.iter().map(|&sim| if sim >= threshold { format!("{:.4}", sim) } else { "0.0000".to_string() }).collect::<Vec<String>>().join(","));
-                } else {
-                    line.push_str(&results_slice.iter()
-                        .map(|(key, count)| format!("{}:{:.4}", *key as Gid, *count as f64 / self.s as f64))
-                        .collect::<Vec<String>>()
-                        .join(","));
                 }
-            } else if is_matrix {
-                let full_row = vec!["0.0000"; num_refs];
-                line.push_str(&full_row.join(","));
-            }
-            line
-        }).collect();
 
-        for line in output_lines { writeln!(writer, "{}", line).unwrap(); }
+                // Write the full row to the line string without intermediate collections.
+                let mut first = true;
+                for sim in full_row {
+                    if first {
+                        first = false;
+                    } else {
+                        line.push(',');
+                    }
+                    if sim >= threshold {
+                        write!(&mut line, "{:.4}", sim).unwrap();
+                    } else {
+                        line.push_str("0.0000");
+                    }
+                }
+            } else { // Sparse mode
+                let mut first = true;
+                while let Some((key, _)) = results_iter.peek() {
+                    if (*key >> 32) == query_gid {
+                        let (key, count) = results_iter.next().unwrap();
+                        if first {
+                            first = false;
+                        } else {
+                            line.push(',');
+                        }
+                        let sim = count as f64 / self.s as f64;
+                        write!(&mut line, "{}:{:.4}", key as Gid, sim).unwrap();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            writeln!(writer, "{}", line).unwrap();
+        }
         
         println!("\nAll-vs-all comparison complete. Total time: {} seconds.", start_time.elapsed().as_secs());
     }
-    
+
     fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
         let file = File::create(output_file).expect("Cannot create output file");
         if zstd_level > 0 { Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish()) } else { Box::new(BufWriter::new(file)) }
