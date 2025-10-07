@@ -417,7 +417,7 @@ impl Index {
         println!("Number of Genomes: {}", self.genome_numbers);
     }
 
-    pub fn all_vs_all_comparison(
+pub fn all_vs_all_comparison(
         &self,
         query_index: &Index,
         threshold: f64,
@@ -428,10 +428,11 @@ impl Index {
         shard_zstd_level: i32,
         temp_dir_path: Option<&str>,
     ) {
+        const NUM_SHARDS: usize = 8192;
         if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
-            if soft_limit < hard_limit {
-                println!("Attempting to increase open file limit from {} to {}.", soft_limit, hard_limit);
-                if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, hard_limit) {
+            if soft_limit < NUM_SHARDS as u64 {
+                // println!("Attempting to increase open file limit from {} to {}.", soft_limit, NUM_SHARDS);
+                if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, NUM_SHARDS as u64) {
                     eprintln!("Warning: Failed to increase open file limit: {}. This may cause errors.", e);
                 }
             }
@@ -448,8 +449,7 @@ impl Index {
             println!("Similarity threshold of {} requires at least {} shared fingerprints.", threshold, min_required_score);
         }
 
-        const NUM_SHARDS: usize = 2048;
-        const SHARD_BUFFER_SIZE: usize = 256 * 1024;
+        
         const LOCAL_BUFFER_FLUSH_THRESHOLD: usize = 1024;
 
         let mut writer = self.create_writer(output_file, zstd_level);
@@ -497,7 +497,7 @@ impl Index {
             };
             let file = File::create(&path).expect("Failed to create shard file.");
             shard_paths.push(path);
-            let writer = BufWriter::with_capacity(SHARD_BUFFER_SIZE, file);
+            let writer = BufWriter::with_capacity(LOCAL_BUFFER_FLUSH_THRESHOLD, file);
             let shard_writer = if shard_zstd_level > 0 {
                 let encoder = ZstdEncoder::new(writer, shard_zstd_level).expect("Failed to create zstd encoder");
                 ShardWriter::Compressed(encoder)
@@ -557,15 +557,30 @@ impl Index {
             }).collect()
         });
         
-        println!("Flushing remaining thread buffers in parallel...");
-        (0..NUM_SHARDS).into_par_iter().for_each(|shard_index| {
-            let mut writer_lock = shard_writers[shard_index].lock().unwrap();
-            for thread_buffers in &remaining_buffers {
-                let buffer = &thread_buffers[shard_index];
-                if !buffer.is_empty() {
-                    for &key in buffer {
+        println!("Reorganizing and flushing remaining thread buffers...");
+        
+        // Transpose the remaining buffers from a thread-major layout to a shard-major layout.
+        // This allows us to give ownership of all buffers for a specific shard to a single parallel task.
+        let mut buffers_by_shard: Vec<Vec<Vec<u64>>> = (0..NUM_SHARDS).map(|_| Vec::new()).collect();
+        for thread_buffers in remaining_buffers.into_iter() {
+            for (shard_index, shard_buffer) in thread_buffers.into_iter().enumerate() {
+                if !shard_buffer.is_empty() {
+                    buffers_by_shard[shard_index].push(shard_buffer);
+                }
+            }
+        }
+        
+        // Flush the reorganized buffers in parallel.
+        // By using into_par_iter(), each task gets ownership of the buffers for its assigned shard.
+        buffers_by_shard.into_par_iter().enumerate().for_each(|(shard_index, buffers_for_this_shard)| {
+            if !buffers_for_this_shard.is_empty() {
+                let mut writer_lock = shard_writers[shard_index].lock().unwrap();
+                // This inner loop takes ownership of each individual buffer.
+                for buffer in buffers_for_this_shard {
+                    for &key in &buffer {
                         writer_lock.write_u64::<LittleEndian>(key).unwrap();
                     }
+                    // `buffer` goes out of scope here and its memory is deallocated.
                 }
             }
         });
@@ -669,7 +684,7 @@ impl Index {
         
         println!("\nAll-vs-all comparison complete. Total time: {} seconds.", start_time.elapsed().as_secs());
     }
-   
+    
     fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
         let file = File::create(output_file).expect("Cannot create output file");
         if zstd_level > 0 { Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish()) } else { Box::new(BufWriter::new(file)) }
