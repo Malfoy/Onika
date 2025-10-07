@@ -415,6 +415,10 @@ impl Index {
         println!("Number of Genomes: {}", self.genome_numbers);
     }
 
+
+
+
+    
 pub fn all_vs_all_comparison(
         &self,
         query_index: &Index,
@@ -519,11 +523,34 @@ pub fn all_vs_all_comparison(
                             if *query_count > 0 {
                                 let ref_gids = decode_gid_list(*ref_count, ref_bytes, self.is_compressed);
                                 let query_gids = decode_gid_list(*query_count, query_bytes, query_index.is_compressed);
+                                let num_keys_per_query = ref_gids.len();
+
                                 for &query_gid in &query_gids {
                                     let shard_index = revhash64(query_gid as u64) as usize % NUM_SHARDS;
-                                    for &ref_gid in &ref_gids {
-                                        let key = (query_gid as u64) << 32 | (ref_gid as u64);
-                                        local_shard_buffers[shard_index].push(key);
+                                    
+                                    // If this batch would overfill the buffer, flush and write directly to disk.
+                                    if local_shard_buffers[shard_index].len() + num_keys_per_query >= LOCAL_BUFFER_FLUSH_THRESHOLD {
+                                        let mut writer_lock = shard_writers[shard_index].lock().unwrap();
+
+                                        // Flush existing buffer contents first.
+                                        if !local_shard_buffers[shard_index].is_empty() {
+                                            for &key in &local_shard_buffers[shard_index] {
+                                                writer_lock.write_u64::<LittleEndian>(key).unwrap();
+                                            }
+                                            local_shard_buffers[shard_index].clear();
+                                        }
+
+                                        // Write the new large batch of keys directly to disk.
+                                        for &ref_gid in &ref_gids {
+                                            let key = (query_gid as u64) << 32 | (ref_gid as u64);
+                                            writer_lock.write_u64::<LittleEndian>(key).unwrap();
+                                        }
+                                    } else {
+                                        // Otherwise, the batch is small enough to buffer in memory.
+                                        for &ref_gid in &ref_gids {
+                                            let key = (query_gid as u64) << 32 | (ref_gid as u64);
+                                            local_shard_buffers[shard_index].push(key);
+                                        }
                                     }
                                 }
                             }
@@ -532,7 +559,6 @@ pub fn all_vs_all_comparison(
 
                     for (shard_index, buffer) in local_shard_buffers.iter_mut().enumerate() {
                         if buffer.len() >= LOCAL_BUFFER_FLUSH_THRESHOLD {
-                            // Wait for the lock instead of just trying.
                             let mut writer_lock = shard_writers[shard_index].lock().unwrap();
                             for &key in buffer.iter() {
                                 writer_lock.write_u64::<LittleEndian>(key).unwrap();
@@ -685,20 +711,23 @@ pub fn all_vs_all_comparison(
         println!("\nAll-vs-all comparison complete. Total time: {} seconds.", start_time.elapsed().as_secs());
     }
 
-    fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
-        let file = File::create(output_file).expect("Cannot create output file");
-        if zstd_level > 0 { Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish()) } else { Box::new(BufWriter::new(file)) }
-    }
 
-    fn path_for_reading(&self) -> &str {
-        let IndexData::OnDisk { path, .. } = &self.data;
-        path
-    }
+
     
-    fn toc_for_reading(&self) -> &[(u64, u64)] {
-        let IndexData::OnDisk { toc, .. } = &self.data;
-        toc
-    }
+fn create_writer<'a>(&self, output_file: &'a str, zstd_level: i32) -> Box<dyn Write + 'a> {
+    let file = File::create(output_file).expect("Cannot create output file");
+    if zstd_level > 0 { Box::new(ZstdEncoder::new(file, zstd_level).unwrap().auto_finish()) } else { Box::new(BufWriter::new(file)) }
+}
+
+fn path_for_reading(&self) -> &str {
+    let IndexData::OnDisk { path, .. } = &self.data;
+    path
+}
+
+fn toc_for_reading(&self) -> &[(u64, u64)] {
+    let IndexData::OnDisk { toc, .. } = &self.data;
+    toc
+}
 }
 
 fn read_pos_from_file(file: &mut File, toc: &[(u64, u64)], pos: usize, fp_range: u64) -> Vec<(u32, Vec<u8>)> {
