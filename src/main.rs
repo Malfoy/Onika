@@ -1,15 +1,14 @@
-#[macro_use]
-extern crate clap;
-extern crate flate2;
-extern crate rayon;
-extern crate zstd;
-extern crate f128;
-extern crate num_traits;
-extern crate needletail;
-extern crate byteorder;
 extern crate ahash;
+extern crate byteorder;
+extern crate clap;
+extern crate f128;
+extern crate flate2;
+extern crate needletail;
+extern crate num_cpus;
+extern crate num_traits;
+extern crate rayon;
 extern crate tempfile;
-extern crate num_cpus; // <-- Added this
+extern crate zstd;
 use jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -18,10 +17,10 @@ static GLOBAL: Jemalloc = Jemalloc;
 mod onika_index;
 mod utils;
 
-use clap::{App, SubCommand, Arg, ArgGroup, ArgMatches};
-use onika_index::{Index, IndexBuilder, SketchMode, open_compressed_file};
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
+use onika_index::{open_compressed_file, Index, IndexBuilder, SketchMode};
+use std::io::BufRead;
 use std::time::Instant;
-use std::io::{ BufRead};
 
 /// Estimates the average document size by sampling the first 100 documents or sequences.
 fn estimate_genome_size(matches: &ArgMatches) -> u32 {
@@ -29,10 +28,19 @@ fn estimate_genome_size(matches: &ArgMatches) -> u32 {
     let mut total_len: u64 = 0;
     let mut doc_count: u64 = 0;
 
-    println!("Sampling up to {} documents/sequences to estimate average size...", SAMPLE_SIZE);
-    
-    let fof_path = matches.value_of("input_fof").or(matches.value_of("ref_fof"));
-    let fasta_path = matches.value_of("input_fasta").or(matches.value_of("ref_fasta"));
+    println!(
+        "Sampling up to {} documents/sequences to estimate average size...",
+        SAMPLE_SIZE
+    );
+
+    let fof_path: Option<&str> = matches
+        .get_one::<String>("input_fof")
+        .map(|s| s.as_str())
+        .or_else(|| matches.get_one::<String>("ref_fof").map(|s| s.as_str()));
+    let fasta_path: Option<&str> = matches
+        .get_one::<String>("input_fasta")
+        .map(|s| s.as_str())
+        .or_else(|| matches.get_one::<String>("ref_fasta").map(|s| s.as_str()));
 
     if let Some(fof_path) = fof_path {
         if let Ok(reader) = open_compressed_file(fof_path) {
@@ -79,166 +87,349 @@ fn estimate_genome_size(matches: &ArgMatches) -> u32 {
 }
 
 fn main() {
-    let matches = App::new("Onika-rs")
+    let cli_matches = Command::new("Onika-rs")
         .version("1.0")
         .author("Rust Translation")
         .about("A tool for MinHash sketching and all-versus-all comparison.")
-        .arg(Arg::with_name("threads")
-            .long("threads")
-            .global(true)
-            .help("Set the number of threads for parallel operations.")
-            .value_name("INT")
-            .takes_value(true))
-        .subcommand(SubCommand::with_name("sketch")
-            .about("Builds sketches from a dataset and saves them to a file.")
-            .arg(Arg::with_name("input_fof").long("input-fof").value_name("FILE").help("Input dataset: a file of FASTA/Q file paths.").takes_value(true))
-            .arg(Arg::with_name("input_fasta").long("input-fasta").value_name("FILE").help("Input dataset: a single FASTA/Q file where each record is a document.").takes_value(true))
-            .group(ArgGroup::with_name("input_mode").args(&["input_fof", "input_fasta"]).required(true))
-            .arg(Arg::with_name("output").short("o").long("output").value_name("FILE").help("Output file to save the sketch index (.bin).").required(true).takes_value(true))
-            .arg(Arg::with_name("no_compress").long("no-compress").help("Skips sorting and compressing the index; faster build, larger index."))
-            .arg(Arg::with_name("k").short("k").long("k_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
-            .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .global(true)
+                .help("Set the number of threads for parallel operations.")
+                .value_name("INT")
+                .value_parser(clap::value_parser!(usize)),
         )
-        .subcommand(SubCommand::with_name("compare")
-            .about("Compares two datasets, which can be raw files or pre-computed sketches.")
-            .arg(Arg::with_name("ref_fof").long("ref-fof").value_name("FILE").takes_value(true))
-            .arg(Arg::with_name("ref_fasta").long("ref-fasta").value_name("FILE").takes_value(true))
-            .arg(Arg::with_name("ref_sketch").long("ref-sketch").value_name("FILE").takes_value(true))
-            .group(ArgGroup::with_name("reference").args(&["ref_fof", "ref_fasta", "ref_sketch"]).required(true))
-            .arg(Arg::with_name("query_fof").long("query-fof").value_name("FILE").takes_value(true))
-            .arg(Arg::with_name("query_fasta").long("query-fasta").value_name("FILE").takes_value(true))
-            .arg(Arg::with_name("query_sketch").long("query-sketch").value_name("FILE").takes_value(true))
-            .group(ArgGroup::with_name("query").args(&["query_fof", "query_fasta", "query_sketch"]).required(true))
-            .arg(Arg::with_name("output").short("o").long("output").value_name("FILE").default_value("output.txt").takes_value(true))
-            .arg(Arg::with_name("threshold").long("threshold").value_name("FLOAT").default_value("0.0").takes_value(true))
-            .arg(Arg::with_name("matrix").long("matrix"))
-            .arg(Arg::with_name("print_stats").long("print-stats"))
-            .arg(Arg::with_name("no_compress").long("no-compress").help("For on-the-fly sketching, skips sorting and compression."))
-            .arg(Arg::with_name("k").short("k").long("k_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("s").short("s").long("s_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("w").short("w").long("w_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
-            .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
-            .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
-            .arg(Arg::with_name("shard_zstd_level").long("shard-zstd-level").value_name("LEVEL").default_value("2").takes_value(true).help("Zstd level for temporary shard files (0 for none)."))
-            .arg(Arg::with_name("temp_dir").long("temp-dir").value_name("PATH").takes_value(true).help("Directory for temporary files."))
+        .subcommand(
+            Command::new("sketch")
+                .about("Builds sketches from a dataset and saves them to a file.")
+                .arg(
+                    Arg::new("input_fof")
+                        .long("input-fof")
+                        .value_name("FILE")
+                        .help("Input dataset: a file of FASTA/Q file paths."),
+                )
+                .arg(
+                    Arg::new("input_fasta")
+                        .long("input-fasta")
+                        .value_name("FILE")
+                        .help("Input dataset: a single FASTA/Q file where each record is a document."),
+                )
+                .group(
+                    ArgGroup::new("input_mode")
+                        .args(["input_fof", "input_fasta"])
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .help("Output file to save the sketch index (.bin).")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("no_compress")
+                        .long("no-compress")
+                        .help("Skips sorting and compressing the index; faster build, larger index.")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("k")
+                        .short('k')
+                        .long("k_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("s")
+                        .short('s')
+                        .long("s_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("w")
+                        .short('w')
+                        .long("w_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("e")
+                        .short('e')
+                        .long("e_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("sketch_mode")
+                        .long("sketch-mode")
+                        .value_name("MODE")
+                        .default_value("default")
+                        .value_parser(["default", "perfect"]),
+                )
+                .arg(
+                    Arg::new("zstd_level")
+                        .long("zstd-level")
+                        .value_name("LEVEL")
+                        .default_value("1")
+                        .value_parser(clap::value_parser!(i32)),
+                ),
+        )
+        .subcommand(
+            Command::new("compare")
+                .about("Compares two datasets, which can be raw files or pre-computed sketches.")
+                .arg(
+                    Arg::new("ref_fof")
+                        .long("ref-fof")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ref_fasta")
+                        .long("ref-fasta")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("ref_sketch")
+                        .long("ref-sketch")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("query_fof")
+                        .long("query-fof")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("query_fasta")
+                        .long("query-fasta")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("query_sketch")
+                        .long("query-sketch")
+                        .value_name("FILE"),
+                )
+                .arg(
+                    Arg::new("output")
+                        .short('o')
+                        .long("output")
+                        .value_name("FILE")
+                        .required(true),
+                )
+                .arg(
+                    Arg::new("threshold")
+                        .long("threshold")
+                        .value_name("FLOAT")
+                        .value_parser(clap::value_parser!(f64)),
+                )
+                .arg(
+                    Arg::new("matrix")
+                        .long("matrix")
+                        .help("Output a full similarity matrix instead of sparse format.")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("print_stats")
+                        .long("print-stats")
+                        .help("Print basic statistics for both indices before comparison.")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("no_compress")
+                        .long("no-compress")
+                        .help("Write uncompressed shard files. Useful for debugging or if compression overhead is too high.")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("k")
+                        .short('k')
+                        .long("k_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("s")
+                        .short('s')
+                        .long("s_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("w")
+                        .short('w')
+                        .long("w_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("e")
+                        .short('e')
+                        .long("e_size")
+                        .value_name("INT")
+                        .value_parser(clap::value_parser!(u32)),
+                )
+                .arg(
+                    Arg::new("sketch_mode")
+                        .long("sketch-mode")
+                        .value_name("MODE")
+                        .default_value("default")
+                        .value_parser(["default", "perfect"]),
+                )
+                .arg(
+                    Arg::new("zstd_level")
+                        .long("zstd-level")
+                        .value_name("LEVEL")
+                        .default_value("1")
+                        .value_parser(clap::value_parser!(i32)),
+                )
+                .arg(
+                    Arg::new("shard_zstd_level")
+                        .long("shard-zstd-level")
+                        .value_name("LEVEL")
+                        .default_value("2")
+                        .help("Zstd compression level for each shard file. Higher values yield better compression but slower writes. Use 0 to disable.")
+                        .value_parser(clap::value_parser!(i32)),
+                )
+                .arg(
+                    Arg::new("temp_dir")
+                        .long("temp-dir")
+                        .value_name("PATH")
+                        .help("Directory for temporary files. Defaults to the system temp directory."),
+                ),
         )
         .get_matches();
 
-    // Initialize the global thread pool ONCE at the start.
-    // Use num_cpus::get() as the default to avoid initializing the pool too early.
-    let threads = value_t!(matches, "threads", usize)
-        .unwrap_or_else(|_| num_cpus::get());
+    let threads = cli_matches
+        .get_one::<usize>("threads")
+        .copied()
+        .unwrap_or_else(num_cpus::get);
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .build_global()
         .unwrap();
 
-    if let Some(matches) = matches.subcommand_matches("sketch") {
-        let w = value_t!(matches, "w", u32).unwrap_or(16);
-        let s = value_t!(matches, "s", u32).unwrap_or(16);
-        let k = value_t!(matches, "k", u32).unwrap_or(31);
-        let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
+    if let Some(matches) = cli_matches.subcommand_matches("sketch") {
+        let w = matches.get_one::<u32>("w").copied().unwrap_or(16);
+        let s = matches.get_one::<u32>("s").copied().unwrap_or(10);
+        let k = matches.get_one::<u32>("k").copied().unwrap_or(31);
+        let sketch_mode = match matches
+            .get_one::<String>("sketch_mode")
+            .map(|s| s.as_str())
+            .unwrap_or("default")
+        {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
-        let output_file = matches.value_of("output").unwrap();
-        let compress = !matches.is_present("no_compress");
-        
-        let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
+        let zstd_level = matches.get_one::<i32>("zstd_level").copied().unwrap_or(1);
+        let output_file = matches.get_one::<String>("output").unwrap();
+        let compress = !matches.get_flag("no_compress");
+
+        let e_arg = matches.get_one::<u32>("e").copied();
+        let e = if sketch_mode == SketchMode::Perfect && e_arg.is_none() {
             let estimated_e = estimate_genome_size(matches);
             println!("Estimated genome size (e): {}", estimated_e);
             estimated_e
         } else {
-            value_t!(matches, "e", u32).unwrap_or(5_000_000)
+            e_arg.unwrap_or(5_000_000)
         };
-        
+
         println!("--- Building Sketch Index ---");
         let start_time = Instant::now();
         let mut builder = IndexBuilder::new(s, k, w, e, sketch_mode);
 
-        if let Some(fof) = matches.value_of("input_fof") {
+        if let Some(fof) = matches.get_one::<String>("input_fof") {
             builder.index_file_of_files(fof);
-        } else if let Some(fasta_file) = matches.value_of("input_fasta") {
+        } else if let Some(fasta_file) = matches.get_one::<String>("input_fasta") {
             builder.index_fasta_file(fasta_file);
         }
-        
-        let index = builder.into_final_index(output_file, compress, zstd_level).expect("Failed to finalize index.");
+
+        let index = builder
+            .into_final_index(output_file, compress, zstd_level)
+            .expect("Failed to finalize index.");
         println!("Sketching took {} seconds.", start_time.elapsed().as_secs());
-        
+
         println!("Dumping sketch index to file: {}", output_file);
         if let Err(e) = index.dump_index_disk(output_file) {
             eprintln!("Error dumping index: {}", e);
         }
-
-    } else if let Some(matches) = matches.subcommand_matches("compare") {
-        let sketch_mode = match matches.value_of("sketch_mode").unwrap() {
+    } else if let Some(matches) = cli_matches.subcommand_matches("compare") {
+        let sketch_mode = match matches
+            .get_one::<String>("sketch_mode")
+            .map(|s| s.as_str())
+            .unwrap_or("default")
+        {
             "perfect" => SketchMode::Perfect,
             _ => SketchMode::Default,
         };
-        let zstd_level = value_t!(matches, "zstd_level", i32).unwrap_or(1);
-        let shard_zstd_level = value_t!(matches, "shard_zstd_level", i32).unwrap_or(1);
-        let temp_dir_path = matches.value_of("temp_dir");
-        let output_file = matches.value_of("output").unwrap();
-        let threshold = value_t!(matches, "threshold", f64).unwrap_or(0.0);
-        let is_matrix = matches.is_present("matrix");
-        let compress = !matches.is_present("no_compress");
-        
-        let w = value_t!(matches, "w", u32).unwrap_or(16);
-        let s = value_t!(matches, "s", u32).unwrap_or(16);
-        let k = value_t!(matches, "k", u32).unwrap_or(31);
-        let e = if sketch_mode == SketchMode::Perfect && !matches.is_present("e") {
+        let zstd_level = matches.get_one::<i32>("zstd_level").copied().unwrap_or(1);
+        let shard_zstd_level = matches
+            .get_one::<i32>("shard_zstd_level")
+            .copied()
+            .unwrap_or(2);
+        let temp_dir_path = matches.get_one::<String>("temp_dir").map(|s| s.as_str());
+        let output_file = matches.get_one::<String>("output").unwrap();
+        let threshold = matches.get_one::<f64>("threshold").copied().unwrap_or(0.0);
+        let is_matrix = matches.get_flag("matrix");
+        let compress = !matches.get_flag("no_compress");
+
+        let w = matches.get_one::<u32>("w").copied().unwrap_or(16);
+        let s = matches.get_one::<u32>("s").copied().unwrap_or(16);
+        let k = matches.get_one::<u32>("k").copied().unwrap_or(31);
+        let e_arg = matches.get_one::<u32>("e").copied();
+        let e = if sketch_mode == SketchMode::Perfect && e_arg.is_none() {
             let estimated_e = estimate_genome_size(matches);
             println!("Estimated genome size (e): {}", estimated_e);
             estimated_e
         } else {
-            value_t!(matches, "e", u32).unwrap_or(5_000_000)
+            e_arg.unwrap_or(5_000_000)
         };
-        
-        let ref_index = if let Some(sketch_file) = matches.value_of("ref_sketch") {
+
+        let ref_index = if let Some(sketch_file) = matches.get_one::<String>("ref_sketch") {
             Index::from_file(sketch_file).expect("Failed to load reference sketch file")
         } else {
             println!("--- Building Reference Index On-the-fly ---");
             let start = Instant::now();
             let mut builder = IndexBuilder::new(s, k, w, e, sketch_mode);
-            if let Some(fof) = matches.value_of("ref_fof") {
+            if let Some(fof) = matches.get_one::<String>("ref_fof") {
                 builder.index_file_of_files(fof);
-            } else if let Some(fasta_file) = matches.value_of("ref_fasta") {
+            } else if let Some(fasta_file) = matches.get_one::<String>("ref_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index(output_file, compress, zstd_level).expect("Failed to finalize reference index.");
-            println!("Reference indexing took {} seconds.", start.elapsed().as_secs());
+            let index = builder
+                .into_final_index(output_file, compress, zstd_level)
+                .expect("Failed to finalize reference index.");
+            println!(
+                "Reference indexing took {} seconds.",
+                start.elapsed().as_secs()
+            );
             index
         };
 
-        let query_index = if let Some(sketch_file) = matches.value_of("query_sketch") {
+        let query_index = if let Some(sketch_file) = matches.get_one::<String>("query_sketch") {
             Index::from_file(sketch_file).expect("Failed to load query sketch file")
         } else {
             println!("\n--- Building Query Index On-the-fly ---");
             let start = Instant::now();
             let mut builder = IndexBuilder::new(s, k, w, e, sketch_mode);
-            if let Some(fof) = matches.value_of("query_fof") {
+            if let Some(fof) = matches.get_one::<String>("query_fof") {
                 builder.index_file_of_files(fof);
-            } else if let Some(fasta_file) = matches.value_of("query_fasta") {
+            } else if let Some(fasta_file) = matches.get_one::<String>("query_fasta") {
                 builder.index_fasta_file(fasta_file);
             }
-            let index = builder.into_final_index(output_file, compress, zstd_level).expect("Failed to finalize query index.");
+            let index = builder
+                .into_final_index(output_file, compress, zstd_level)
+                .expect("Failed to finalize query index.");
             println!("Query indexing took {} seconds.", start.elapsed().as_secs());
             index
         };
-        
-        if matches.is_present("print_stats") {
+
+        if matches.get_flag("print_stats") {
             println!("\n--- Reference Index Stats ---");
             ref_index.print_stats();
             println!("\n--- Query Index Stats ---");
             query_index.print_stats();
         }
-        
+
         ref_index.all_vs_all_comparison(
             &query_index,
             threshold,

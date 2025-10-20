@@ -1,6 +1,3 @@
-
-
-
 // 64-bit reverse hash functions (placeholders)
 pub fn revhash64(x: u64) -> u64 {
     let mut x_mut = x;
@@ -19,7 +16,6 @@ pub fn unrevhash64(x: u64) -> u64 {
     x_mut ^= x_mut >> 33;
     x_mut
 }
-
 
 pub fn hash_family(x: u64, factor: u32) -> u64 {
     unrevhash64(x).wrapping_add((factor as u64).wrapping_mul(revhash64(x)))
