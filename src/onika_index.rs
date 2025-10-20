@@ -9,12 +9,13 @@ use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rlimit;
+use std::collections::hash_map::Entry;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tempfile::NamedTempFile;
@@ -544,8 +545,11 @@ impl Index {
             let pos_iterator: Vec<usize> = (0..num_pos).collect();
             let pos_chunks: Vec<&[usize]> = pos_iterator.chunks(chunk_size).collect();
 
+            let remaining_positions = AtomicUsize::new(num_pos);
+            let remaining_positions = &remaining_positions;
             let shared_counts = &shared_counts;
             pos_chunks.into_par_iter().for_each(|pos_chunk| {
+                let remaining_positions = remaining_positions;
                 let mut ref_file = File::open(&self.path_for_reading())
                     .expect("Cannot open reference index file in thread.");
                 let mut query_file = File::open(&query_index.path_for_reading())
@@ -602,11 +606,35 @@ impl Index {
                             if let Some(mutex) = shared_counts.get(query_gid as usize) {
                                 let mut global_map = mutex.lock().unwrap();
                                 for &ref_gid in &ref_gid_buf {
-                                    *global_map.entry(ref_gid).or_insert(0) += 1;
+                                    if min_required_score == 0 {
+                                        *global_map.entry(ref_gid).or_insert(0) += 1;
+                                        continue;
+                                    }
+
+                                    match global_map.entry(ref_gid) {
+                                        Entry::Occupied(mut occ) => {
+                                            let new_count = occ.get_mut();
+                                            *new_count += 1;
+                                            let remaining =
+                                                remaining_positions.load(Ordering::Relaxed) as u32;
+                                            if (*new_count + remaining) < min_required_score {
+                                                occ.remove_entry();
+                                            }
+                                        }
+                                        Entry::Vacant(vac) => {
+                                            let remaining =
+                                                remaining_positions.load(Ordering::Relaxed) as u32;
+                                            if 1 + remaining >= min_required_score {
+                                                vac.insert(1);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
+
+                    remaining_positions.fetch_sub(1, Ordering::Relaxed);
                 }
             })
         });
