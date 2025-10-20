@@ -124,7 +124,7 @@ fn main() {
             .arg(Arg::with_name("e").short("e").long("e_size").value_name("INT").takes_value(true))
             .arg(Arg::with_name("sketch_mode").long("sketch-mode").value_name("MODE").default_value("default").takes_value(true))
             .arg(Arg::with_name("zstd_level").long("zstd-level").value_name("LEVEL").default_value("1").takes_value(true))
-            .arg(Arg::with_name("shard_zstd_level").long("shard-zstd-level").value_name("LEVEL").default_value("1").takes_value(true).help("Zstd level for temporary shard files (0 for none)."))
+            .arg(Arg::with_name("shard_zstd_level").long("shard-zstd-level").value_name("LEVEL").default_value("2").takes_value(true).help("Zstd level for temporary shard files (0 for none)."))
             .arg(Arg::with_name("temp_dir").long("temp-dir").value_name("PATH").takes_value(true).help("Directory for temporary files."))
         )
         .get_matches();
