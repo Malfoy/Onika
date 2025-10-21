@@ -14,9 +14,10 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use parking_lot::Mutex;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use tempfile::NamedTempFile;
 use zstd::stream::write::Encoder as ZstdEncoder;
@@ -559,6 +560,8 @@ impl Index {
                 let mut query_gid_buf: Vec<Gid> = Vec::new();
 
                 for &pos in pos_chunk {
+                    let future_positions = remaining_positions.load(Ordering::Relaxed);
+                    let future_after_current = future_positions.saturating_sub(1) as u32;
                     let ref_pos_index = read_pos_from_file(
                         &mut ref_file,
                         &self.toc_for_reading(),
@@ -604,7 +607,7 @@ impl Index {
 
                         for &query_gid in &query_gid_buf {
                             if let Some(mutex) = shared_counts.get(query_gid as usize) {
-                                let mut global_map = mutex.lock().unwrap();
+                                let mut global_map = mutex.lock();
                                 for &ref_gid in &ref_gid_buf {
                                     if min_required_score == 0 {
                                         *global_map.entry(ref_gid).or_insert(0) += 1;
@@ -615,16 +618,14 @@ impl Index {
                                         Entry::Occupied(mut occ) => {
                                             let new_count = occ.get_mut();
                                             *new_count += 1;
-                                            let remaining =
-                                                remaining_positions.load(Ordering::Relaxed) as u32;
-                                            if (*new_count + remaining) < min_required_score {
+                                            if (*new_count + future_after_current)
+                                                < min_required_score
+                                            {
                                                 occ.remove_entry();
                                             }
                                         }
                                         Entry::Vacant(vac) => {
-                                            let remaining =
-                                                remaining_positions.load(Ordering::Relaxed) as u32;
-                                            if 1 + remaining >= min_required_score {
+                                            if 1 + future_after_current >= min_required_score {
                                                 vac.insert(1);
                                             }
                                         }
@@ -640,7 +641,7 @@ impl Index {
         });
         let mut all_results: Vec<(u32, u32, u32)> = Vec::new();
         for (query_gid, query_mutex) in shared_counts.iter().enumerate() {
-            let query_map = query_mutex.lock().unwrap();
+            let query_map = query_mutex.lock();
             for (&ref_gid, &count) in query_map.iter() {
                 if count >= min_required_score {
                     all_results.push((query_gid as u32, ref_gid, count));
