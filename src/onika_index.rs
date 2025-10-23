@@ -24,6 +24,12 @@ use zstd::stream::write::Encoder as ZstdEncoder;
 
 type Gid = u32;
 
+struct PendingRecord {
+    count: u32,
+    processed_positions: u64,
+    future_after_current: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum SketchMode {
@@ -543,10 +549,6 @@ impl Index {
 
         let fingerprint_bits = self._w;
 
-        let total_lock_waits = AtomicU64::new(0);
-        let max_entries_seen = AtomicU32::new(0);
-        let max_entries_query = AtomicU32::new(0);
-
         pool.install(|| {
             let total_positions = self.sketch_size as u64;
             let num_pos = total_positions as usize;
@@ -561,9 +563,6 @@ impl Index {
             let enable_prob_heuristic = use_probabilistic_pruning && min_required_score > 0;
             let remaining_positions = &remaining_positions;
             let shared_counts = &shared_counts;
-            let total_lock_waits = &total_lock_waits;
-            let max_entries_seen = &max_entries_seen;
-            let max_entries_query = &max_entries_query;
             pos_chunks.into_par_iter().for_each(|pos_chunk| {
                 let total_positions = total_positions;
                 let enable_prob_heuristic = enable_prob_heuristic;
@@ -575,6 +574,8 @@ impl Index {
 
                 let mut ref_gid_buf: Vec<Gid> = Vec::new();
                 let mut query_gid_buf: Vec<Gid> = Vec::new();
+                let mut pending_updates: AHashMap<u32, AHashMap<u32, PendingRecord>> =
+                    AHashMap::new();
 
                 for &pos in pos_chunk {
                     let future_positions = remaining_positions.load(Ordering::Relaxed) as u64;
@@ -625,89 +626,59 @@ impl Index {
 
                         for &query_gid in &query_gid_buf {
                             if let Some(mutex) = shared_counts.get(query_gid as usize) {
-                                let start_lock = std::time::Instant::now();
-                                let mut global_map = mutex.lock();
-                                let elapsed = start_lock.elapsed();
-                                total_lock_waits
-                                    .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
-
-                                for &ref_gid in &ref_gid_buf {
-                                    match global_map.entry(ref_gid) {
-                                        Entry::Occupied(mut occ) => {
-                                            if min_required_score == 0 {
-                                                *occ.get_mut() += 1;
-                                                continue;
-                                            }
-                                            let val = occ.get_mut();
-                                            *val += 1;
-                                            let count = *val;
-                                            if !Self::probability_allows_threshold(
-                                                enable_prob_heuristic,
-                                                min_required_score,
-                                                count,
+                                if let Some(mut global_map) = mutex.try_lock() {
+                                    for &ref_gid in &ref_gid_buf {
+                                        Self::apply_hit(
+                                            &mut global_map,
+                                            ref_gid,
+                                            enable_prob_heuristic,
+                                            min_required_score,
+                                            processed_positions,
+                                            future_after_current,
+                                            fingerprint_bits,
+                                        );
+                                    }
+                                } else {
+                                    let query_pending = pending_updates
+                                        .entry(query_gid)
+                                        .or_insert_with(AHashMap::new);
+                                    for &ref_gid in &ref_gid_buf {
+                                        let entry = query_pending
+                                            .entry(ref_gid)
+                                            .or_insert(PendingRecord {
+                                                count: 0,
                                                 processed_positions,
                                                 future_after_current,
-                                                fingerprint_bits,
-                                            ) {
-                                                occ.remove_entry();
-                                            }
-                                        }
-                                        Entry::Vacant(vac) => {
-                                            if min_required_score == 0
-                                                || Self::probability_allows_threshold(
-                                                    enable_prob_heuristic,
-                                                    min_required_score,
-                                                    1,
-                                                    processed_positions,
-                                                    future_after_current,
-                                                    fingerprint_bits,
-                                                )
-                                            {
-                                                vac.insert(1);
-                                                let new_len = global_map.len() as u32;
-                                                let mut prev = max_entries_seen.load(Ordering::Relaxed);
-                                                while new_len > prev {
-                                                    match max_entries_seen.compare_exchange(
-                                                        prev,
-                                                        new_len,
-                                                        Ordering::Relaxed,
-                                                        Ordering::Relaxed,
-                                                    ) {
-                                                        Ok(_) => {
-                                                            max_entries_query
-                                                                .store(query_gid, Ordering::Relaxed);
-                                                            break;
-                                                        }
-                                                        Err(actual) => prev = actual,
-                                                    }
-                                                }
-                                            }
-                                        }
+                                            });
+                                        entry.count = entry.count.saturating_add(1);
+                                        entry.processed_positions = processed_positions;
+                                        entry.future_after_current = future_after_current;
                                     }
                                 }
                             }
                         }
+
+                        Self::flush_pending(
+                            shared_counts,
+                            &mut pending_updates,
+                            enable_prob_heuristic,
+                            min_required_score,
+                            fingerprint_bits,
+                        );
                     }
 
                     remaining_positions.fetch_sub(1, Ordering::Relaxed);
                 }
+
+                Self::flush_pending(
+                    shared_counts,
+                    &mut pending_updates,
+                    enable_prob_heuristic,
+                    min_required_score,
+                    fingerprint_bits,
+                );
             })
         });
-        let total_lock_wait_ns = total_lock_waits.load(Ordering::Relaxed);
-        let avg_lock_wait_ns = if total_lock_wait_ns == 0 {
-            0.0
-        } else {
-            total_lock_wait_ns as f64 / shared_counts.len() as f64
-        };
-        let max_entries = max_entries_seen.load(Ordering::Relaxed);
-        let max_entries_query_id = max_entries_query.load(Ordering::Relaxed);
-        println!(
-            "end main allvall (total lock wait = {} ms, avg per query = {:.3} ms, max entries = {} on query {})",
-            total_lock_wait_ns as f64 / 1_000_000.0,
-            avg_lock_wait_ns / 1_000_000.0,
-            max_entries,
-            max_entries_query_id
-        );
         let lines: Vec<String> = (0..num_queries)
             .into_par_iter()
             .map(|query_idx| {
@@ -799,6 +770,87 @@ impl Index {
     fn toc_for_reading(&self) -> &[(u64, u64)] {
         let IndexData::OnDisk { toc, .. } = &self.data;
         toc
+    }
+
+    #[inline]
+    fn apply_hit(
+        map: &mut AHashMap<u32, u32>,
+        ref_gid: u32,
+        enable_prob_heuristic: bool,
+        min_required_score: u32,
+        processed_positions: u64,
+        future_after_current: u64,
+        fingerprint_bits: u32,
+    ) {
+        match map.entry(ref_gid) {
+            Entry::Occupied(mut occ) => {
+                if min_required_score == 0 {
+                    *occ.get_mut() += 1;
+                    return;
+                }
+                let val = occ.get_mut();
+                *val += 1;
+                let count = *val;
+                if !Self::probability_allows_threshold(
+                    enable_prob_heuristic,
+                    min_required_score,
+                    count,
+                    processed_positions,
+                    future_after_current,
+                    fingerprint_bits,
+                ) {
+                    occ.remove_entry();
+                }
+            }
+            Entry::Vacant(vac) => {
+                if min_required_score == 0
+                    || Self::probability_allows_threshold(
+                        enable_prob_heuristic,
+                        min_required_score,
+                        1,
+                        processed_positions,
+                        future_after_current,
+                        fingerprint_bits,
+                    )
+                {
+                    vac.insert(1);
+                }
+            }
+        }
+    }
+
+    fn flush_pending(
+        shared_counts: &[Mutex<AHashMap<u32, u32>>],
+        pending: &mut AHashMap<u32, AHashMap<u32, PendingRecord>>,
+        enable_prob_heuristic: bool,
+        min_required_score: u32,
+        fingerprint_bits: u32,
+    ) {
+        if pending.is_empty() {
+            return;
+        }
+        let query_ids: Vec<u32> = pending.keys().copied().collect();
+        for query_gid in query_ids {
+            if let Some(mutex) = shared_counts.get(query_gid as usize) {
+                if let Some(mut global_map) = mutex.try_lock() {
+                    if let Some(records) = pending.remove(&query_gid) {
+                        for (ref_gid, record) in records {
+                            for _ in 0..record.count {
+                                Self::apply_hit(
+                                    &mut global_map,
+                                    ref_gid,
+                                    enable_prob_heuristic,
+                                    min_required_score,
+                                    record.processed_positions,
+                                    record.future_after_current,
+                                    fingerprint_bits,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[inline]
