@@ -1,4 +1,3 @@
-extern crate ahash;
 extern crate byteorder;
 extern crate clap;
 extern crate f128;
@@ -229,6 +228,12 @@ fn main() {
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("probabilistic_threshold")
+                        .long("prob-threshold-heuristic")
+                        .help("Enable probability-based pruning when estimating pairs unlikely to reach the threshold.")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
                     Arg::new("print_stats")
                         .long("print-stats")
                         .help("Print basic statistics for both indices before comparison.")
@@ -371,6 +376,7 @@ fn main() {
         let threshold = matches.get_one::<f64>("threshold").copied().unwrap_or(0.0);
         let is_matrix = matches.get_flag("matrix");
         let compress = !matches.get_flag("no_compress");
+        let use_probabilistic_pruning = matches.get_flag("probabilistic_threshold");
 
         let w = matches.get_one::<u32>("w").copied().unwrap_or(16);
         let s = matches.get_one::<u32>("s").copied().unwrap_or(16);
@@ -439,6 +445,7 @@ fn main() {
             threads,
             shard_zstd_level,
             temp_dir_path,
+            use_probabilistic_pruning,
         );
     }
 }

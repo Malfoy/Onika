@@ -1,5 +1,4 @@
 use crate::utils::*;
-use ahash::AHashMap;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use f128::f128;
 use flate2::read::GzDecoder;
@@ -9,7 +8,6 @@ use num_traits::{Float, ToPrimitive};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rlimit;
-use std::collections::hash_map::Entry;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -23,6 +21,12 @@ use tempfile::NamedTempFile;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 type Gid = u32;
+
+#[derive(Clone)]
+struct ScoreEntry {
+    ref_gid: u32,
+    count: u32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -502,6 +506,7 @@ impl Index {
         num_threads: usize,
         shard_zstd_level: i32,
         temp_dir_path: Option<&str>,
+        use_probabilistic_pruning: bool,
     ) { 
         if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
             if soft_limit < hard_limit {
@@ -536,8 +541,8 @@ impl Index {
             .build()
             .unwrap();
 
-        let shared_counts: Vec<Mutex<AHashMap<u32, u32>>> = (0..num_queries)
-            .map(|_| Mutex::new(AHashMap::new()))
+        let shared_counts: Vec<Mutex<Vec<ScoreEntry>>> = (0..num_queries)
+            .map(|_| Mutex::new(Vec::new()))
             .collect();
 
         pool.install(|| {
@@ -547,9 +552,13 @@ impl Index {
             let pos_chunks: Vec<&[usize]> = pos_iterator.chunks(chunk_size).collect();
 
             let remaining_positions = AtomicUsize::new(num_pos);
+            let total_positions = num_pos as u32;
+            let enable_prob_heuristic = use_probabilistic_pruning && min_required_score > 0;
             let remaining_positions = &remaining_positions;
             let shared_counts = &shared_counts;
             pos_chunks.into_par_iter().for_each(|pos_chunk| {
+                let total_positions = total_positions;
+                let enable_prob_heuristic = enable_prob_heuristic;
                 let remaining_positions = remaining_positions;
                 let mut ref_file = File::open(&self.path_for_reading())
                     .expect("Cannot open reference index file in thread.");
@@ -562,6 +571,7 @@ impl Index {
                 for &pos in pos_chunk {
                     let future_positions = remaining_positions.load(Ordering::Relaxed);
                     let future_after_current = future_positions.saturating_sub(1) as u32;
+                    let processed_positions = total_positions.saturating_sub(future_after_current);
                     let ref_pos_index = read_pos_from_file(
                         &mut ref_file,
                         &self.toc_for_reading(),
@@ -607,26 +617,43 @@ impl Index {
 
                         for &query_gid in &query_gid_buf {
                             if let Some(mutex) = shared_counts.get(query_gid as usize) {
-                                let mut global_map = mutex.lock();
+                                let mut global_list = mutex.lock();
                                 for &ref_gid in &ref_gid_buf {
-                                    if min_required_score == 0 {
-                                        *global_map.entry(ref_gid).or_insert(0) += 1;
-                                        continue;
-                                    }
-
-                                    match global_map.entry(ref_gid) {
-                                        Entry::Occupied(mut occ) => {
-                                            let new_count = occ.get_mut();
-                                            *new_count += 1;
-                                            if (*new_count + future_after_current)
-                                                < min_required_score
-                                            {
-                                                occ.remove_entry();
+                                    match global_list.binary_search_by_key(&ref_gid, |e| e.ref_gid) {
+                                        Ok(idx) => {
+                                            if min_required_score == 0 {
+                                                global_list[idx].count += 1;
+                                                continue;
+                                            }
+                                            global_list[idx].count += 1;
+                                            let count = global_list[idx].count;
+                                            if !Self::probability_allows_threshold(
+                                                enable_prob_heuristic,
+                                                min_required_score,
+                                                count,
+                                                processed_positions,
+                                                future_after_current,
+                                            ) {
+                                                global_list.remove(idx);
                                             }
                                         }
-                                        Entry::Vacant(vac) => {
-                                            if 1 + future_after_current >= min_required_score {
-                                                vac.insert(1);
+                                        Err(insert_idx) => {
+                                            if min_required_score == 0
+                                                || Self::probability_allows_threshold(
+                                                    enable_prob_heuristic,
+                                                    min_required_score,
+                                                    1,
+                                                    processed_positions,
+                                                    future_after_current,
+                                                )
+                                            {
+                                                global_list.insert(
+                                                    insert_idx,
+                                                    ScoreEntry {
+                                                        ref_gid,
+                                                        count: 1,
+                                                    },
+                                                );
                                             }
                                         }
                                     }
@@ -641,10 +668,10 @@ impl Index {
         });
         let mut all_results: Vec<(u32, u32, u32)> = Vec::new();
         for (query_gid, query_mutex) in shared_counts.iter().enumerate() {
-            let query_map = query_mutex.lock();
-            for (&ref_gid, &count) in query_map.iter() {
-                if count >= min_required_score {
-                    all_results.push((query_gid as u32, ref_gid, count));
+            let query_list = query_mutex.lock();
+            for entry in query_list.iter() {
+                if entry.count >= min_required_score {
+                    all_results.push((query_gid as u32, entry.ref_gid, entry.count));
                 }
             }
         }
@@ -734,6 +761,54 @@ impl Index {
     fn toc_for_reading(&self) -> &[(u64, u64)] {
         let IndexData::OnDisk { toc, .. } = &self.data;
         toc
+    }
+
+    #[inline]
+    fn probability_allows_threshold(
+        enable: bool,
+        min_required: u32,
+        count: u32,
+        processed: u32,
+        remaining: u32,
+    ) -> bool {
+        if count >= min_required || !enable || min_required == 0 {
+            return true;
+        }
+        if remaining == 0 {
+            return false;
+        }
+        let delta = min_required - count;
+        if delta == 0 {
+            return true;
+        }
+
+        const PRIOR_SUCC: f64 = 1.0;
+        const PRIOR_FAIL: f64 = 1.0;
+        let processed = processed.max(1);
+        if processed < count {
+            return true;
+        }
+
+        let failures = processed - count;
+        let successes = count as f64 + PRIOR_SUCC;
+        let failures = failures as f64 + PRIOR_FAIL;
+        let p_hat = successes / (successes + failures);
+
+        let remaining_f = remaining as f64;
+        let mu = p_hat * remaining_f;
+        if mu <= 0.0 {
+            return false;
+        }
+
+        let variance = remaining_f * p_hat * (1.0 - p_hat);
+        if variance <= 1e-9 {
+            return mu >= delta as f64;
+        }
+        let sigma = variance.sqrt();
+        let target = (delta as f64 - 0.5).max(0.0);
+        let z = (target - mu) / sigma;
+        const Z_CUTOFF: f64 = 2.3263478740408408;
+        z <= Z_CUTOFF
     }
 }
 
