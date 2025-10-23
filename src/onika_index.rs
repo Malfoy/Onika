@@ -14,6 +14,7 @@ use std::collections::hash_map::Entry;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::mem;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -23,6 +24,160 @@ use tempfile::NamedTempFile;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 type Gid = u32;
+
+const LIST_TO_MAP_THRESHOLD: usize = 128;
+
+enum QueryData {
+    List(Vec<(u32, u32)>),
+    Map(AHashMap<u32, u32>),
+}
+
+struct QueryAccumulator {
+    data: QueryData,
+}
+
+impl QueryAccumulator {
+    fn new() -> Self {
+        Self {
+            data: QueryData::List(Vec::new()),
+        }
+    }
+
+    fn promote_to_map(&mut self) {
+        if let QueryData::List(list) = mem::replace(&mut self.data, QueryData::Map(AHashMap::new()))
+        {
+            if let QueryData::Map(ref mut map) = self.data {
+                map.reserve(list.len());
+                for (ref_gid, count) in list {
+                    map.insert(ref_gid, count);
+                }
+            }
+        }
+    }
+
+    fn apply_hit(
+        &mut self,
+        ref_gid: u32,
+        enable_prob_heuristic: bool,
+        min_required_score: u32,
+        processed_positions: u64,
+        future_after_current: u64,
+        fingerprint_bits: u32,
+    ) {
+        match &mut self.data {
+            QueryData::List(list) => {
+                let mut promote = false;
+                match list.binary_search_by_key(&ref_gid, |(gid, _)| *gid) {
+                    Ok(idx) => {
+                        if min_required_score == 0 {
+                            list[idx].1 += 1;
+                        } else {
+                            list[idx].1 += 1;
+                            let count = list[idx].1;
+                            if !Index::probability_allows_threshold(
+                                enable_prob_heuristic,
+                                min_required_score,
+                                count,
+                                processed_positions,
+                                future_after_current,
+                                fingerprint_bits,
+                            ) {
+                                list.remove(idx);
+                            }
+                        }
+                    }
+                    Err(insert_idx) => {
+                        if min_required_score == 0
+                            || Index::probability_allows_threshold(
+                                enable_prob_heuristic,
+                                min_required_score,
+                                1,
+                                processed_positions,
+                                future_after_current,
+                                fingerprint_bits,
+                            )
+                        {
+                            list.insert(insert_idx, (ref_gid, 1));
+                            if list.len() > LIST_TO_MAP_THRESHOLD {
+                                promote = true;
+                            }
+                        }
+                    }
+                }
+                if promote {
+                    self.promote_to_map();
+                }
+            }
+            QueryData::Map(map) => {
+                match map.entry(ref_gid) {
+                    Entry::Occupied(mut occ) => {
+                        if min_required_score == 0 {
+                            *occ.get_mut() += 1;
+                            return;
+                        }
+                        let val = occ.get_mut();
+                        *val += 1;
+                        let count = *val;
+                        if !Index::probability_allows_threshold(
+                            enable_prob_heuristic,
+                            min_required_score,
+                            count,
+                            processed_positions,
+                            future_after_current,
+                            fingerprint_bits,
+                        ) {
+                            occ.remove_entry();
+                        }
+                    }
+                    Entry::Vacant(vac) => {
+                        if min_required_score == 0
+                            || Index::probability_allows_threshold(
+                                enable_prob_heuristic,
+                                min_required_score,
+                                1,
+                                processed_positions,
+                                future_after_current,
+                                fingerprint_bits,
+                            )
+                        {
+                            vac.insert(1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn for_each<F: FnMut(u32, u32)>(&self, mut f: F) {
+        match &self.data {
+            QueryData::List(list) => {
+                for &(gid, count) in list.iter() {
+                    f(gid, count);
+                }
+            }
+            QueryData::Map(map) => {
+                for (&gid, &count) in map.iter() {
+                    f(gid, count);
+                }
+            }
+        }
+    }
+
+    fn collect_filtered(&self, min_score: u32) -> Vec<(u32, u32)> {
+        match &self.data {
+            QueryData::List(list) => list
+                .iter()
+                .filter(|(_, count)| *count >= min_score)
+                .map(|&(gid, count)| (gid, count))
+                .collect(),
+            QueryData::Map(map) => map
+                .iter()
+                .filter(|(_, &count)| count >= min_score)
+                .map(|(&gid, &count)| (gid, count))
+                .collect(),
+        }
+    }
+}
 
 struct PendingRecord {
     count: u32,
@@ -543,8 +698,8 @@ impl Index {
             .build()
             .unwrap();
 
-        let shared_counts: Vec<Mutex<AHashMap<u32, u32>>> = (0..num_queries)
-            .map(|_| Mutex::new(AHashMap::new()))
+        let shared_counts: Vec<Mutex<QueryAccumulator>> = (0..num_queries)
+            .map(|_| Mutex::new(QueryAccumulator::new()))
             .collect();
 
         let fingerprint_bits = self._w;
@@ -626,10 +781,9 @@ impl Index {
 
                         for &query_gid in &query_gid_buf {
                             if let Some(mutex) = shared_counts.get(query_gid as usize) {
-                                if let Some(mut global_map) = mutex.try_lock() {
+                                if let Some(mut global_acc) = mutex.try_lock() {
                                     for &ref_gid in &ref_gid_buf {
-                                        Self::apply_hit(
-                                            &mut global_map,
+                                        global_acc.apply_hit(
                                             ref_gid,
                                             enable_prob_heuristic,
                                             min_required_score,
@@ -690,15 +844,15 @@ impl Index {
                 if is_matrix {
                     let mut full_row = vec![0.0; num_refs];
                     {
-                        let query_map = shared_counts[query_idx].lock();
-                        for (&ref_gid, &count) in query_map.iter() {
+                        let query_acc = shared_counts[query_idx].lock();
+                        query_acc.for_each(|ref_gid, count| {
                             if count >= min_required_score {
                                 let ref_idx = ref_gid as usize;
                                 if ref_idx < num_refs {
                                     full_row[ref_idx] = count as f64 / self.s as f64;
                                 }
                             }
-                        }
+                        });
                     }
 
                     let mut first = true;
@@ -716,12 +870,8 @@ impl Index {
                     }
                 } else {
                     let mut filtered: Vec<(u32, u32)> = {
-                        let query_map = shared_counts[query_idx].lock();
-                        query_map
-                            .iter()
-                            .filter(|(_, &count)| count >= min_required_score)
-                            .map(|(&ref_gid, &count)| (ref_gid, count))
-                            .collect()
+                        let query_acc = shared_counts[query_idx].lock();
+                        query_acc.collect_filtered(min_required_score)
                     };
                     filtered.sort_unstable_by(|a, b| {
                         b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
@@ -772,55 +922,8 @@ impl Index {
         toc
     }
 
-    #[inline]
-    fn apply_hit(
-        map: &mut AHashMap<u32, u32>,
-        ref_gid: u32,
-        enable_prob_heuristic: bool,
-        min_required_score: u32,
-        processed_positions: u64,
-        future_after_current: u64,
-        fingerprint_bits: u32,
-    ) {
-        match map.entry(ref_gid) {
-            Entry::Occupied(mut occ) => {
-                if min_required_score == 0 {
-                    *occ.get_mut() += 1;
-                    return;
-                }
-                let val = occ.get_mut();
-                *val += 1;
-                let count = *val;
-                if !Self::probability_allows_threshold(
-                    enable_prob_heuristic,
-                    min_required_score,
-                    count,
-                    processed_positions,
-                    future_after_current,
-                    fingerprint_bits,
-                ) {
-                    occ.remove_entry();
-                }
-            }
-            Entry::Vacant(vac) => {
-                if min_required_score == 0
-                    || Self::probability_allows_threshold(
-                        enable_prob_heuristic,
-                        min_required_score,
-                        1,
-                        processed_positions,
-                        future_after_current,
-                        fingerprint_bits,
-                    )
-                {
-                    vac.insert(1);
-                }
-            }
-        }
-    }
-
     fn flush_pending(
-        shared_counts: &[Mutex<AHashMap<u32, u32>>],
+        shared_counts: &[Mutex<QueryAccumulator>],
         pending: &mut AHashMap<u32, AHashMap<u32, PendingRecord>>,
         enable_prob_heuristic: bool,
         min_required_score: u32,
@@ -832,12 +935,11 @@ impl Index {
         let query_ids: Vec<u32> = pending.keys().copied().collect();
         for query_gid in query_ids {
             if let Some(mutex) = shared_counts.get(query_gid as usize) {
-                if let Some(mut global_map) = mutex.try_lock() {
+                if let Some(mut global_acc) = mutex.try_lock() {
                     if let Some(records) = pending.remove(&query_gid) {
                         for (ref_gid, record) in records {
                             for _ in 0..record.count {
-                                Self::apply_hit(
-                                    &mut global_map,
+                                global_acc.apply_hit(
                                     ref_gid,
                                     enable_prob_heuristic,
                                     min_required_score,
