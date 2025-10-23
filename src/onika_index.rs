@@ -5,6 +5,8 @@ use flate2::read::GzDecoder;
 use io::BufWriter;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
+use parking_lot::Mutex;
+use probability::distribution::{Binomial, Distribution};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rlimit;
@@ -12,7 +14,6 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use parking_lot::Mutex;
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -545,14 +546,19 @@ impl Index {
             .map(|_| Mutex::new(Vec::new()))
             .collect();
 
+        let fingerprint_bits = self._w;
+
         pool.install(|| {
-            let num_pos = self.sketch_size as usize;
-            let chunk_size = (num_pos + num_threads - 1) / num_threads;
+            let total_positions = self.sketch_size as u64;
+            let num_pos = total_positions as usize;
+            let chunks_per_thread = 4usize;
+            let chunk_size = ((num_pos + (num_threads * chunks_per_thread) - 1)
+                / (num_threads * chunks_per_thread))
+                .max(1);
             let pos_iterator: Vec<usize> = (0..num_pos).collect();
             let pos_chunks: Vec<&[usize]> = pos_iterator.chunks(chunk_size).collect();
 
             let remaining_positions = AtomicUsize::new(num_pos);
-            let total_positions = num_pos as u32;
             let enable_prob_heuristic = use_probabilistic_pruning && min_required_score > 0;
             let remaining_positions = &remaining_positions;
             let shared_counts = &shared_counts;
@@ -569,8 +575,8 @@ impl Index {
                 let mut query_gid_buf: Vec<Gid> = Vec::new();
 
                 for &pos in pos_chunk {
-                    let future_positions = remaining_positions.load(Ordering::Relaxed);
-                    let future_after_current = future_positions.saturating_sub(1) as u32;
+                    let future_positions = remaining_positions.load(Ordering::Relaxed) as u64;
+                    let future_after_current = future_positions.saturating_sub(1);
                     let processed_positions = total_positions.saturating_sub(future_after_current);
                     let ref_pos_index = read_pos_from_file(
                         &mut ref_file,
@@ -633,6 +639,7 @@ impl Index {
                                                 count,
                                                 processed_positions,
                                                 future_after_current,
+                                                fingerprint_bits,
                                             ) {
                                                 global_list.remove(idx);
                                             }
@@ -645,6 +652,7 @@ impl Index {
                                                     1,
                                                     processed_positions,
                                                     future_after_current,
+                                                    fingerprint_bits,
                                                 )
                                             {
                                                 global_list.insert(
@@ -666,63 +674,57 @@ impl Index {
                 }
             })
         });
-        let mut all_results: Vec<(u32, u32, u32)> = Vec::new();
-        for (query_gid, query_mutex) in shared_counts.iter().enumerate() {
-            let query_list = query_mutex.lock();
-            for entry in query_list.iter() {
-                if entry.count >= min_required_score {
-                    all_results.push((query_gid as u32, entry.ref_gid, entry.count));
-                }
-            }
-        }
 
-        all_results.par_sort_unstable_by(|a, b| {
-            match a.0.cmp(&b.0) {
-                std::cmp::Ordering::Equal => b.2.cmp(&a.2),
-                other => other,
-            }
-        });
+        let lines: Vec<String> = (0..num_queries)
+            .into_par_iter()
+            .map(|query_idx| {
+                let query_gid = query_idx as u32;
+                let mut line =
+                    String::with_capacity(if is_matrix { num_refs * 8 } else { 512 });
+                write!(&mut line, "query_{}\t", query_gid).unwrap();
 
-        let mut results_iter = all_results.into_iter().peekable();
-
-        for query_idx in 0..num_queries {
-            let query_gid = query_idx as u32;
-
-            let mut line = String::with_capacity(if is_matrix { num_refs * 8 } else { 512 });
-            write!(&mut line, "query_{}\t", query_gid).unwrap();
-
-            if is_matrix {
-                let mut full_row = vec![0.0; num_refs];
-                while let Some(&(q, _, _)) = results_iter.peek() {
-                    if q == query_gid {
-                        let (_, ref_gid, count) = results_iter.next().unwrap();
-                        if (ref_gid as usize) < num_refs {
-                            full_row[ref_gid as usize] = count as f64 / self.s as f64;
+                if is_matrix {
+                    let mut full_row = vec![0.0; num_refs];
+                    {
+                        let query_list = shared_counts[query_idx].lock();
+                        for entry in query_list.iter() {
+                            if entry.count >= min_required_score {
+                                let ref_gid = entry.ref_gid as usize;
+                                if ref_gid < num_refs {
+                                    full_row[ref_gid] = entry.count as f64 / self.s as f64;
+                                }
+                            }
                         }
-                    } else {
-                        break;
                     }
-                }
 
-                let mut first = true;
-                for sim in full_row {
-                    if first {
-                        first = false;
-                    } else {
-                        line.push(',');
+                    let mut first = true;
+                    for sim in full_row {
+                        if first {
+                            first = false;
+                        } else {
+                            line.push(',');
+                        }
+                        if sim >= threshold {
+                            write!(&mut line, "{:.4}", sim).unwrap();
+                        } else {
+                            line.push_str("0.0000");
+                        }
                     }
-                    if sim >= threshold {
-                        write!(&mut line, "{:.4}", sim).unwrap();
-                    } else {
-                        line.push_str("0.0000");
-                    }
-                }
-            } else {
-                // Sparse mode
-                let mut first = true;
-                while let Some(&(q, _, _)) = results_iter.peek() {
-                    if q == query_gid {
-                        let (_, ref_gid, count) = results_iter.next().unwrap();
+                } else {
+                    let mut filtered: Vec<(u32, u32)> = {
+                        let query_list = shared_counts[query_idx].lock();
+                        query_list
+                            .iter()
+                            .filter(|entry| entry.count >= min_required_score)
+                            .map(|entry| (entry.ref_gid, entry.count))
+                            .collect()
+                    };
+                    filtered.sort_unstable_by(|a, b| {
+                        b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+                    });
+
+                    let mut first = true;
+                    for (ref_gid, count) in filtered {
                         if first {
                             first = false;
                         } else {
@@ -730,11 +732,14 @@ impl Index {
                         }
                         let sim = count as f64 / self.s as f64;
                         write!(&mut line, "{}:{:.4}", ref_gid, sim).unwrap();
-                    } else {
-                        break;
                     }
                 }
-            }
+
+                line
+            })
+            .collect();
+
+        for line in lines {
             writeln!(writer, "{}", line).unwrap();
         }
 
@@ -768,47 +773,41 @@ impl Index {
         enable: bool,
         min_required: u32,
         count: u32,
-        processed: u32,
-        remaining: u32,
+        processed: u64,
+        remaining: u64,
+        fingerprint_bits: u32,
     ) -> bool {
         if count >= min_required || !enable || min_required == 0 {
+            return true;
+        }
+        if processed < 100 {
             return true;
         }
         if remaining == 0 {
             return false;
         }
-        let delta = min_required - count;
+        let delta = min_required.saturating_sub(count);
         if delta == 0 {
             return true;
         }
-
-        const PRIOR_SUCC: f64 = 1.0;
-        const PRIOR_FAIL: f64 = 1.0;
-        let processed = processed.max(1);
-        if processed < count {
-            return true;
-        }
-
-        let failures = processed - count;
-        let successes = count as f64 + PRIOR_SUCC;
-        let failures = failures as f64 + PRIOR_FAIL;
-        let p_hat = successes / (successes + failures);
-
-        let remaining_f = remaining as f64;
-        let mu = p_hat * remaining_f;
-        if mu <= 0.0 {
+        if delta as u64 > remaining {
             return false;
         }
 
-        let variance = remaining_f * p_hat * (1.0 - p_hat);
-        if variance <= 1e-9 {
-            return mu >= delta as f64;
+        let probability_threshold = 0.01_f64;
+        let p = 2f64.powi(-2 * fingerprint_bits as i32);
+        if !p.is_finite() || p <= 0.0 {
+            return true;
         }
-        let sigma = variance.sqrt();
-        let target = (delta as f64 - 0.5).max(0.0);
-        let z = (target - mu) / sigma;
-        const Z_CUTOFF: f64 = 2.3263478740408408;
-        z <= Z_CUTOFF
+
+        let trials = match usize::try_from(remaining) {
+            Ok(value) => value,
+            Err(_) => return true,
+        };
+        let dist = Binomial::new(trials, p);
+        let cdf = dist.distribution(((delta - 1) as usize) as f64);
+        let tail = 1.0 - cdf;
+        tail >= probability_threshold
     }
 }
 
