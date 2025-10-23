@@ -1,4 +1,5 @@
 use crate::utils::*;
+use ahash::AHashMap;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use f128::f128;
 use flate2::read::GzDecoder;
@@ -6,10 +7,10 @@ use io::BufWriter;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use parking_lot::Mutex;
-use probability::distribution::{Binomial, Distribution};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rlimit;
+use std::collections::hash_map::Entry;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -22,12 +23,6 @@ use tempfile::NamedTempFile;
 use zstd::stream::write::Encoder as ZstdEncoder;
 
 type Gid = u32;
-
-#[derive(Clone)]
-struct ScoreEntry {
-    ref_gid: u32,
-    count: u32,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
@@ -542,11 +537,15 @@ impl Index {
             .build()
             .unwrap();
 
-        let shared_counts: Vec<Mutex<Vec<ScoreEntry>>> = (0..num_queries)
-            .map(|_| Mutex::new(Vec::new()))
+        let shared_counts: Vec<Mutex<AHashMap<u32, u32>>> = (0..num_queries)
+            .map(|_| Mutex::new(AHashMap::new()))
             .collect();
 
         let fingerprint_bits = self._w;
+
+        let total_lock_waits = AtomicU64::new(0);
+        let max_entries_seen = AtomicU32::new(0);
+        let max_entries_query = AtomicU32::new(0);
 
         pool.install(|| {
             let total_positions = self.sketch_size as u64;
@@ -562,6 +561,9 @@ impl Index {
             let enable_prob_heuristic = use_probabilistic_pruning && min_required_score > 0;
             let remaining_positions = &remaining_positions;
             let shared_counts = &shared_counts;
+            let total_lock_waits = &total_lock_waits;
+            let max_entries_seen = &max_entries_seen;
+            let max_entries_query = &max_entries_query;
             pos_chunks.into_par_iter().for_each(|pos_chunk| {
                 let total_positions = total_positions;
                 let enable_prob_heuristic = enable_prob_heuristic;
@@ -623,16 +625,22 @@ impl Index {
 
                         for &query_gid in &query_gid_buf {
                             if let Some(mutex) = shared_counts.get(query_gid as usize) {
-                                let mut global_list = mutex.lock();
+                                let start_lock = std::time::Instant::now();
+                                let mut global_map = mutex.lock();
+                                let elapsed = start_lock.elapsed();
+                                total_lock_waits
+                                    .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+
                                 for &ref_gid in &ref_gid_buf {
-                                    match global_list.binary_search_by_key(&ref_gid, |e| e.ref_gid) {
-                                        Ok(idx) => {
+                                    match global_map.entry(ref_gid) {
+                                        Entry::Occupied(mut occ) => {
                                             if min_required_score == 0 {
-                                                global_list[idx].count += 1;
+                                                *occ.get_mut() += 1;
                                                 continue;
                                             }
-                                            global_list[idx].count += 1;
-                                            let count = global_list[idx].count;
+                                            let val = occ.get_mut();
+                                            *val += 1;
+                                            let count = *val;
                                             if !Self::probability_allows_threshold(
                                                 enable_prob_heuristic,
                                                 min_required_score,
@@ -641,10 +649,10 @@ impl Index {
                                                 future_after_current,
                                                 fingerprint_bits,
                                             ) {
-                                                global_list.remove(idx);
+                                                occ.remove_entry();
                                             }
                                         }
-                                        Err(insert_idx) => {
+                                        Entry::Vacant(vac) => {
                                             if min_required_score == 0
                                                 || Self::probability_allows_threshold(
                                                     enable_prob_heuristic,
@@ -655,13 +663,24 @@ impl Index {
                                                     fingerprint_bits,
                                                 )
                                             {
-                                                global_list.insert(
-                                                    insert_idx,
-                                                    ScoreEntry {
-                                                        ref_gid,
-                                                        count: 1,
-                                                    },
-                                                );
+                                                vac.insert(1);
+                                                let new_len = global_map.len() as u32;
+                                                let mut prev = max_entries_seen.load(Ordering::Relaxed);
+                                                while new_len > prev {
+                                                    match max_entries_seen.compare_exchange(
+                                                        prev,
+                                                        new_len,
+                                                        Ordering::Relaxed,
+                                                        Ordering::Relaxed,
+                                                    ) {
+                                                        Ok(_) => {
+                                                            max_entries_query
+                                                                .store(query_gid, Ordering::Relaxed);
+                                                            break;
+                                                        }
+                                                        Err(actual) => prev = actual,
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -674,7 +693,21 @@ impl Index {
                 }
             })
         });
-
+        let total_lock_wait_ns = total_lock_waits.load(Ordering::Relaxed);
+        let avg_lock_wait_ns = if total_lock_wait_ns == 0 {
+            0.0
+        } else {
+            total_lock_wait_ns as f64 / shared_counts.len() as f64
+        };
+        let max_entries = max_entries_seen.load(Ordering::Relaxed);
+        let max_entries_query_id = max_entries_query.load(Ordering::Relaxed);
+        println!(
+            "end main allvall (total lock wait = {} ms, avg per query = {:.3} ms, max entries = {} on query {})",
+            total_lock_wait_ns as f64 / 1_000_000.0,
+            avg_lock_wait_ns / 1_000_000.0,
+            max_entries,
+            max_entries_query_id
+        );
         let lines: Vec<String> = (0..num_queries)
             .into_par_iter()
             .map(|query_idx| {
@@ -686,12 +719,12 @@ impl Index {
                 if is_matrix {
                     let mut full_row = vec![0.0; num_refs];
                     {
-                        let query_list = shared_counts[query_idx].lock();
-                        for entry in query_list.iter() {
-                            if entry.count >= min_required_score {
-                                let ref_gid = entry.ref_gid as usize;
-                                if ref_gid < num_refs {
-                                    full_row[ref_gid] = entry.count as f64 / self.s as f64;
+                        let query_map = shared_counts[query_idx].lock();
+                        for (&ref_gid, &count) in query_map.iter() {
+                            if count >= min_required_score {
+                                let ref_idx = ref_gid as usize;
+                                if ref_idx < num_refs {
+                                    full_row[ref_idx] = count as f64 / self.s as f64;
                                 }
                             }
                         }
@@ -712,11 +745,11 @@ impl Index {
                     }
                 } else {
                     let mut filtered: Vec<(u32, u32)> = {
-                        let query_list = shared_counts[query_idx].lock();
-                        query_list
+                        let query_map = shared_counts[query_idx].lock();
+                        query_map
                             .iter()
-                            .filter(|entry| entry.count >= min_required_score)
-                            .map(|entry| (entry.ref_gid, entry.count))
+                            .filter(|(_, &count)| count >= min_required_score)
+                            .map(|(&ref_gid, &count)| (ref_gid, count))
                             .collect()
                     };
                     filtered.sort_unstable_by(|a, b| {
@@ -775,12 +808,9 @@ impl Index {
         count: u32,
         processed: u64,
         remaining: u64,
-        fingerprint_bits: u32,
+        _fingerprint_bits: u32,
     ) -> bool {
         if count >= min_required || !enable || min_required == 0 {
-            return true;
-        }
-        if processed < 100 {
             return true;
         }
         if remaining == 0 {
@@ -794,20 +824,36 @@ impl Index {
             return false;
         }
 
-        let probability_threshold = 0.01_f64;
-        let p = 2f64.powi(-2 * fingerprint_bits as i32);
-        if !p.is_finite() || p <= 0.0 {
+        const PRIOR_SUCC: f64 = 1.0;
+        const PRIOR_FAIL: f64 = 1.0;
+        if processed < 100 {
+            return true;
+        }
+        let processed = processed.max(1);
+        if processed < count as u64 {
             return true;
         }
 
-        let trials = match usize::try_from(remaining) {
-            Ok(value) => value,
-            Err(_) => return true,
-        };
-        let dist = Binomial::new(trials, p);
-        let cdf = dist.distribution(((delta - 1) as usize) as f64);
-        let tail = 1.0 - cdf;
-        tail >= probability_threshold
+        let failures = processed - count as u64;
+        let successes = count as f64 + PRIOR_SUCC;
+        let failures = failures as f64 + PRIOR_FAIL;
+        let p_hat = successes / (successes + failures);
+
+        let remaining_f = remaining as f64;
+        let mu = p_hat * remaining_f;
+        if mu <= 0.0 {
+            return false;
+        }
+
+        let variance = remaining_f * p_hat * (1.0 - p_hat);
+        if variance <= 1e-9 {
+            return mu >= delta as f64;
+        }
+        let sigma = variance.sqrt();
+        let target = (delta as f64 - 0.5).max(0.0);
+        let z = (target - mu) / sigma;
+        const Z_CUTOFF: f64 = 3.0902323061678132;
+        z <= Z_CUTOFF
     }
 }
 

@@ -291,7 +291,7 @@ fn main() {
                     Arg::new("shard_zstd_level")
                         .long("shard-zstd-level")
                         .value_name("LEVEL")
-                        .default_value("2")
+                        .default_value("1")
                         .help("Zstd compression level for each shard file. Higher values yield better compression but slower writes. Use 0 to disable.")
                         .value_parser(clap::value_parser!(i32)),
                 )
