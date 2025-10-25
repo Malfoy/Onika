@@ -48,8 +48,8 @@ impl QueryAccumulator {
         {
             if let QueryData::Map(ref mut map) = self.data {
                 map.reserve(list.len());
-                for (ref_gid, count) in list {
-                    map.insert(ref_gid, count);
+                for (ref_gid, stats) in list {
+                    map.insert(ref_gid, stats);
                 }
             }
         }
@@ -63,6 +63,7 @@ impl QueryAccumulator {
         processed_positions: u64,
         future_after_current: u64,
         fingerprint_bits: u32,
+        z_cutoff: f64,
     ) {
         match &mut self.data {
             QueryData::List(list) => {
@@ -81,6 +82,7 @@ impl QueryAccumulator {
                                 processed_positions,
                                 future_after_current,
                                 fingerprint_bits,
+                                z_cutoff,
                             ) {
                                 list.remove(idx);
                             }
@@ -95,6 +97,7 @@ impl QueryAccumulator {
                                 processed_positions,
                                 future_after_current,
                                 fingerprint_bits,
+                                z_cutoff,
                             )
                         {
                             list.insert(insert_idx, (ref_gid, 1));
@@ -125,6 +128,7 @@ impl QueryAccumulator {
                             processed_positions,
                             future_after_current,
                             fingerprint_bits,
+                            z_cutoff,
                         ) {
                             occ.remove_entry();
                         }
@@ -138,6 +142,7 @@ impl QueryAccumulator {
                                 processed_positions,
                                 future_after_current,
                                 fingerprint_bits,
+                                z_cutoff,
                             )
                         {
                             vac.insert(1);
@@ -664,7 +669,8 @@ impl Index {
         shard_zstd_level: i32,
         temp_dir_path: Option<&str>,
         use_probabilistic_pruning: bool,
-    ) { 
+        prob_threshold_probability: f64,
+    ) {
         if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
             if soft_limit < hard_limit {
                 if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, hard_limit)
@@ -703,6 +709,8 @@ impl Index {
             .collect();
 
         let fingerprint_bits = self._w;
+        let prob_tail = prob_threshold_probability.clamp(1e-12, 0.5);
+        let z_cutoff = Self::tail_probability_to_z(prob_tail);
 
         pool.install(|| {
             let total_positions = self.sketch_size as u64;
@@ -790,6 +798,7 @@ impl Index {
                                             processed_positions,
                                             future_after_current,
                                             fingerprint_bits,
+                                            z_cutoff,
                                         );
                                     }
                                 } else {
@@ -818,6 +827,7 @@ impl Index {
                             enable_prob_heuristic,
                             min_required_score,
                             fingerprint_bits,
+                            z_cutoff,
                         );
                     }
 
@@ -830,16 +840,18 @@ impl Index {
                     enable_prob_heuristic,
                     min_required_score,
                     fingerprint_bits,
+                    z_cutoff,
                 );
             })
         });
-        let lines: Vec<String> = (0..num_queries)
+        let line_results: Vec<(String, usize)> = (0..num_queries)
             .into_par_iter()
             .map(|query_idx| {
                 let query_gid = query_idx as u32;
                 let mut line =
                     String::with_capacity(if is_matrix { num_refs * 8 } else { 512 });
                 write!(&mut line, "query_{}\t", query_gid).unwrap();
+                let mut scores_count = 0usize;
 
                 if is_matrix {
                     let mut full_row = vec![0.0; num_refs];
@@ -863,6 +875,7 @@ impl Index {
                             line.push(',');
                         }
                         if sim >= threshold {
+                            scores_count += 1;
                             write!(&mut line, "{:.4}", sim).unwrap();
                         } else {
                             line.push_str("0.0000");
@@ -876,6 +889,7 @@ impl Index {
                     filtered.sort_unstable_by(|a, b| {
                         b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
                     });
+                    scores_count = filtered.len();
 
                     let mut first = true;
                     for (ref_gid, count) in filtered {
@@ -889,13 +903,21 @@ impl Index {
                     }
                 }
 
-                line
+                (line, scores_count)
             })
             .collect();
 
-        for line in lines {
+        for (line, _) in &line_results {
             writeln!(writer, "{}", line).unwrap();
         }
+
+        let total_scores_above_threshold: usize =
+            line_results.iter().map(|(_, count)| *count).sum();
+
+        println!(
+            "Total scores above threshold written to output: {}",
+            total_scores_above_threshold
+        );
 
         println!(
             "\nAll-vs-all comparison complete. Total time: {} seconds.",
@@ -928,6 +950,7 @@ impl Index {
         enable_prob_heuristic: bool,
         min_required_score: u32,
         fingerprint_bits: u32,
+        z_cutoff: f64,
     ) {
         if pending.is_empty() {
             return;
@@ -946,6 +969,7 @@ impl Index {
                                     record.processed_positions,
                                     record.future_after_current,
                                     fingerprint_bits,
+                                    z_cutoff,
                                 );
                             }
                         }
@@ -963,12 +987,13 @@ impl Index {
         processed: u64,
         remaining: u64,
         _fingerprint_bits: u32,
+        z_cutoff: f64,
     ) -> bool {
         if count >= min_required || !enable || min_required == 0 {
             return true;
         }
-        if remaining == 0 {
-            return false;
+        if remaining <= 100 {
+            return true;
         }
         let delta = min_required.saturating_sub(count);
         if delta == 0 {
@@ -1006,8 +1031,72 @@ impl Index {
         let sigma = variance.sqrt();
         let target = (delta as f64 - 0.5).max(0.0);
         let z = (target - mu) / sigma;
-        const Z_CUTOFF: f64 = 3.0902323061678132;
-        z <= Z_CUTOFF
+        z <= z_cutoff
+    }
+
+    #[inline]
+    fn tail_probability_to_z(prob_tail: f64) -> f64 {
+        let clamped_tail = prob_tail.clamp(1e-12, 0.5 - 1e-12);
+        let upper_prob = (1.0 - clamped_tail).clamp(1e-12, 1.0 - 1e-12);
+        Self::standard_normal_quantile(upper_prob)
+    }
+
+    #[inline]
+    fn standard_normal_quantile(p: f64) -> f64 {
+        if p <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        if p >= 1.0 {
+            return f64::INFINITY;
+        }
+
+        const A: [f64; 6] = [
+            -3.969_683_028_665_376e+01,
+            2.209_460_984_245_205e+02,
+            -2.759_285_104_469_687e+02,
+            1.383_577_518_672_69e+02,
+            -3.066_479_806_614_716e+01,
+            2.506_628_277_459_239e+00,
+        ];
+        const B: [f64; 5] = [
+            -5.447_609_879_822_406e+01,
+            1.615_858_368_580_409e+02,
+            -1.556_989_798_598_866e+02,
+            6.680_131_188_771_972e+01,
+            -1.328_068_155_288_572e+01,
+        ];
+        const C: [f64; 6] = [
+            -7.784_894_002_430_293e-03,
+            -3.223_964_580_411_365e-01,
+            -2.400_758_277_161_838e+00,
+            -2.549_732_539_343_734e+00,
+            4.374_664_141_464_968e+00,
+            2.938_163_982_698_783e+00,
+        ];
+        const D: [f64; 4] = [
+            7.784_695_709_041_462e-03,
+            3.224_671_290_700_398e-01,
+            2.445_134_137_142_996e+00,
+            3.754_408_661_907_416e+00,
+        ];
+
+        let q = p - 0.5;
+        if q.abs() <= 0.425 {
+            let r = 0.180625 - q * q;
+            let num = ((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5];
+            let den = ((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0;
+            return q * num / den;
+        }
+
+        let (r, sign) = if q < 0.0 {
+            (p, -1.0)
+        } else {
+            (1.0 - p, 1.0)
+        };
+        let r = (-2.0 * r.ln()).sqrt();
+        let num = ((((C[0] * r + C[1]) * r + C[2]) * r + C[3]) * r + C[4]) * r + C[5];
+        let den = (((D[0] * r + D[1]) * r + D[2]) * r + D[3]) * r + 1.0;
+        sign * num / den
     }
 }
 

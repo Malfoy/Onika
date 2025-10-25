@@ -234,6 +234,14 @@ fn main() {
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
+                    Arg::new("prob_threshold_probability")
+                        .long("prob-threshold-probability")
+                        .value_name("FLOAT")
+                        .default_value("0.000001")
+                        .help("Tail probability used by the probabilistic pruning heuristic (e.g. 0.001 for 1 in 1000).")
+                        .value_parser(clap::value_parser!(f64)),
+                )
+                .arg(
                     Arg::new("print_stats")
                         .long("print-stats")
                         .help("Print basic statistics for both indices before comparison.")
@@ -377,6 +385,10 @@ fn main() {
         let is_matrix = matches.get_flag("matrix");
         let compress = !matches.get_flag("no_compress");
         let use_probabilistic_pruning = matches.get_flag("probabilistic_threshold");
+        let prob_threshold_probability = matches
+            .get_one::<f64>("prob_threshold_probability")
+            .copied()
+            .unwrap_or(1.0 / 10_000.0);
 
         let w = matches.get_one::<u32>("w").copied().unwrap_or(16);
         let s = matches.get_one::<u32>("s").copied().unwrap_or(16);
@@ -446,6 +458,7 @@ fn main() {
             shard_zstd_level,
             temp_dir_path,
             use_probabilistic_pruning,
+            prob_threshold_probability,
         );
     }
 }
