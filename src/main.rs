@@ -259,7 +259,7 @@ fn main() {
                     Arg::new("prob_threshold_probability")
                         .long("prob-threshold-probability")
                         .value_name("FLOAT")
-                        .default_value("0.01")
+                        .default_value("0.1")
                         .help("Tail probability used by the probabilistic pruning heuristic (e.g. 0.001 for 1 in 1000).")
                         .value_parser(clap::value_parser!(f64)),
                 )

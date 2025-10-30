@@ -7,7 +7,6 @@ use io::BufWriter;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use parking_lot::Mutex;
-use probability::distribution::{Binomial, Discrete};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rlimit;
@@ -17,6 +16,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::Path;
+use std::f64::consts::{LN_2, PI};
 use std::sync::{
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
     Arc,
@@ -1280,18 +1280,51 @@ impl Index {
             _ => return true,
         };
 
-        let binomial = if threshold_prob <= 0.5 {
-            Binomial::new(trials, threshold_prob)
-        } else {
-            Binomial::with_failure(trials, 1.0 - threshold_prob)
-        };
+        let log_probability = approx_binomial_log_mass(count as usize, trials, threshold_prob);
+        if !log_probability.is_finite() {
+            return log_probability.is_sign_positive();
+        }
 
-        let probability = binomial.mass(count as usize);
-        if !probability.is_finite() {
+        if log_probability >= 0.0 {
             return true;
         }
 
-        probability >= prob_cutoff
+        if prob_cutoff <= 0.0 {
+            return true;
+        }
+
+        let log_cutoff = prob_cutoff.ln();
+        if !log_cutoff.is_finite() {
+            return prob_cutoff > 0.0;
+        }
+
+        log_probability >= log_cutoff
+    }
+}
+
+#[inline]
+fn approx_binomial_log_mass(k: usize, n: usize, p: f64) -> f64 {
+    if n == 0 {
+        return 0.0;
+    }
+
+    let capped_k = k.min(n);
+    let n_f = n as f64;
+    let k_f = capped_k as f64;
+    let diff = k_f - 0.5 * n_f;
+    let clamped_p = p.clamp(1e-12, 1.0 - 1e-12);
+    let q = 1.0 - clamped_p;
+
+    let coeff_log = n_f * LN_2
+        - 0.5 * (PI * n_f / 2.0).ln()
+        - 2.0 * diff * diff / n_f
+        + 23.0 / (18.0 * n_f);
+
+    let log_mass = coeff_log + k_f * clamped_p.ln() + (n_f - k_f) * q.ln();
+    if log_mass > 0.0 {
+        0.0
+    } else {
+        log_mass
     }
 }
 
