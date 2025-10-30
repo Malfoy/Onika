@@ -28,6 +28,8 @@ type Gid = u32;
 
 const LIST_TO_MAP_THRESHOLD: usize = 128;
 
+static BINOMIAL_FAILURE_HIT_THRESHOLD: AtomicU32 = AtomicU32::new(0);
+
 enum QueryData {
     List(Vec<(u32, u32)>),
     Map(AHashMap<u32, u32>),
@@ -1255,12 +1257,13 @@ impl Index {
             return true;
         }
 
-        if processed == 0 {
+        if processed == 0 || processed < count as u64 {
             return true;
         }
 
-        if processed < count as u64 {
-            return true;
+        let cached_failure = BINOMIAL_FAILURE_HIT_THRESHOLD.load(Ordering::Relaxed);
+        if cached_failure > 0 && count <= cached_failure {
+            return false;
         }
 
         let processed_f = processed as f64;
@@ -1282,14 +1285,14 @@ impl Index {
 
         let log_probability = approx_binomial_log_mass(count as usize, trials, threshold_prob);
         if !log_probability.is_finite() {
-            return log_probability.is_sign_positive();
+            if log_probability.is_sign_positive() {
+                return true;
+            }
+            record_binomial_failure(count);
+            return false;
         }
 
         if log_probability >= 0.0 {
-            return true;
-        }
-
-        if prob_cutoff <= 0.0 {
             return true;
         }
 
@@ -1298,7 +1301,12 @@ impl Index {
             return prob_cutoff > 0.0;
         }
 
-        log_probability >= log_cutoff
+        if log_probability >= log_cutoff {
+            true
+        } else {
+            record_binomial_failure(count);
+            false
+        }
     }
 }
 
@@ -1325,6 +1333,22 @@ fn approx_binomial_log_mass(k: usize, n: usize, p: f64) -> f64 {
         0.0
     } else {
         log_mass
+    }
+}
+
+#[inline]
+fn record_binomial_failure(count: u32) {
+    let mut current = BINOMIAL_FAILURE_HIT_THRESHOLD.load(Ordering::Relaxed);
+    while count > current {
+        match BINOMIAL_FAILURE_HIT_THRESHOLD.compare_exchange(
+            current,
+            count,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
     }
 }
 
