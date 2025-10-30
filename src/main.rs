@@ -129,8 +129,30 @@ fn main() {
                 .arg(
                     Arg::new("no_compress")
                         .long("no-compress")
-                        .help("Skips sorting and compressing the index; faster build, larger index.")
+                        .help("Skips stream-vbyte compression (still delta encodes); faster build, larger index.")
                         .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("reorder_similarity")
+                        .long("reorder-similarity")
+                        .help("After building the sketch, greedily reorder sketches by self-similarity to improve locality.")
+                        .action(ArgAction::SetTrue),
+                )
+                .arg(
+                    Arg::new("reorder_threshold")
+                        .long("reorder-threshold")
+                        .value_name("FLOAT")
+                        .default_value("0.5")
+                        .help("Minimum estimated similarity (0-1) a pair must reach to be considered during greedy reordering.")
+                        .value_parser(clap::value_parser!(f64)),
+                )
+                .arg(
+                    Arg::new("reorder_sample")
+                        .long("reorder-sample")
+                        .value_name("INT")
+                        .default_value("100")
+                        .help("Use only the first N partitions (sketch positions) when estimating similarity during reordering (0 = full sketch).")
+                        .value_parser(clap::value_parser!(usize)),
                 )
                 .arg(
                     Arg::new("k")
@@ -237,7 +259,7 @@ fn main() {
                     Arg::new("prob_threshold_probability")
                         .long("prob-threshold-probability")
                         .value_name("FLOAT")
-                        .default_value("0.000001")
+                        .default_value("0.01")
                         .help("Tail probability used by the probabilistic pruning heuristic (e.g. 0.001 for 1 in 1000).")
                         .value_parser(clap::value_parser!(f64)),
                 )
@@ -354,6 +376,62 @@ fn main() {
             builder.index_file_of_files(fof);
         } else if let Some(fasta_file) = matches.get_one::<String>("input_fasta") {
             builder.index_fasta_file(fasta_file);
+        }
+
+        if matches.get_flag("reorder_similarity") {
+            let reorder_threshold = matches
+                .get_one::<f64>("reorder_threshold")
+                .copied()
+                .unwrap_or(0.5)
+                .clamp(0.0, 1.0);
+            let reorder_sample = matches
+                .get_one::<usize>("reorder_sample")
+                .copied()
+                .unwrap_or(100);
+            println!(
+                "Reordering sketches by greedy self-similarity chain (min sim {:.3}, sample {})...",
+                reorder_threshold,
+                if reorder_sample == 0 {
+                    "all".to_string()
+                } else {
+                    reorder_sample.to_string()
+                }
+            );
+            let reorder_start = Instant::now();
+            match builder.reorder_by_similarity(reorder_threshold, reorder_sample, threads) {
+                Ok(order) => {
+                    let preview_len = order.len().min(8);
+                    if preview_len > 0 {
+                        let preview: Vec<String> = order
+                            .iter()
+                            .take(preview_len)
+                            .map(|idx| idx.to_string())
+                            .collect();
+                        println!(
+                            "Reorder complete in {} seconds. Preview (new -> original ids): [{}{}]",
+                            reorder_start.elapsed().as_secs(),
+                            preview.join(", "),
+                            if order.len() > preview_len {
+                                ", ..."
+                            } else {
+                                ""
+                            }
+                        );
+                    } else {
+                        println!(
+                            "Reorder complete in {} seconds. No sketches to reorder.",
+                            reorder_start.elapsed().as_secs()
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Similarity-based reorder failed after {} seconds: {}",
+                        reorder_start.elapsed().as_secs(),
+                        err
+                    );
+                }
+            }
         }
 
         let index = builder

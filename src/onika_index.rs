@@ -7,6 +7,7 @@ use io::BufWriter;
 use nthash::NtHashIterator;
 use num_traits::{Float, ToPrimitive};
 use parking_lot::Mutex;
+use probability::distribution::{Binomial, Discrete};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 use rlimit;
@@ -62,8 +63,8 @@ impl QueryAccumulator {
         min_required_score: u32,
         processed_positions: u64,
         future_after_current: u64,
-        fingerprint_bits: u32,
-        z_cutoff: f64,
+        target_similarity: f64,
+        prob_cutoff: f64,
     ) {
         match &mut self.data {
             QueryData::List(list) => {
@@ -77,12 +78,12 @@ impl QueryAccumulator {
                             let count = list[idx].1;
                             if !Index::probability_allows_threshold(
                                 enable_prob_heuristic,
+                                target_similarity,
+                                prob_cutoff,
                                 min_required_score,
                                 count,
                                 processed_positions,
                                 future_after_current,
-                                fingerprint_bits,
-                                z_cutoff,
                             ) {
                                 list.remove(idx);
                             }
@@ -92,12 +93,12 @@ impl QueryAccumulator {
                         if min_required_score == 0
                             || Index::probability_allows_threshold(
                                 enable_prob_heuristic,
+                                target_similarity,
+                                prob_cutoff,
                                 min_required_score,
                                 1,
                                 processed_positions,
                                 future_after_current,
-                                fingerprint_bits,
-                                z_cutoff,
                             )
                         {
                             list.insert(insert_idx, (ref_gid, 1));
@@ -111,45 +112,43 @@ impl QueryAccumulator {
                     self.promote_to_map();
                 }
             }
-            QueryData::Map(map) => {
-                match map.entry(ref_gid) {
-                    Entry::Occupied(mut occ) => {
-                        if min_required_score == 0 {
-                            *occ.get_mut() += 1;
-                            return;
-                        }
-                        let val = occ.get_mut();
-                        *val += 1;
-                        let count = *val;
-                        if !Index::probability_allows_threshold(
-                            enable_prob_heuristic,
-                            min_required_score,
-                            count,
-                            processed_positions,
-                            future_after_current,
-                            fingerprint_bits,
-                            z_cutoff,
-                        ) {
-                            occ.remove_entry();
-                        }
+            QueryData::Map(map) => match map.entry(ref_gid) {
+                Entry::Occupied(mut occ) => {
+                    if min_required_score == 0 {
+                        *occ.get_mut() += 1;
+                        return;
                     }
-                    Entry::Vacant(vac) => {
-                        if min_required_score == 0
-                            || Index::probability_allows_threshold(
-                                enable_prob_heuristic,
-                                min_required_score,
-                                1,
-                                processed_positions,
-                                future_after_current,
-                                fingerprint_bits,
-                                z_cutoff,
-                            )
-                        {
-                            vac.insert(1);
-                        }
+                    let val = occ.get_mut();
+                    *val += 1;
+                    let count = *val;
+                    if !Index::probability_allows_threshold(
+                        enable_prob_heuristic,
+                        target_similarity,
+                        prob_cutoff,
+                        min_required_score,
+                        count,
+                        processed_positions,
+                        future_after_current,
+                    ) {
+                        occ.remove_entry();
                     }
                 }
-            }
+                Entry::Vacant(vac) => {
+                    if min_required_score == 0
+                        || Index::probability_allows_threshold(
+                            enable_prob_heuristic,
+                            target_similarity,
+                            prob_cutoff,
+                            min_required_score,
+                            1,
+                            processed_positions,
+                            future_after_current,
+                        )
+                    {
+                        vac.insert(1);
+                    }
+                }
+            },
         }
     }
 
@@ -188,6 +187,20 @@ struct PendingRecord {
     count: u32,
     processed_positions: u64,
     future_after_current: u64,
+}
+
+impl Index {
+    fn set_partition_limit(&mut self, limit: u64) {
+        let IndexData::OnDisk { toc, .. } = &mut self.data;
+        if limit == 0 || limit >= toc.len() as u64 {
+            self.sketch_size = self.s;
+        } else {
+            toc.truncate(limit as usize);
+            self.sketch_size = limit;
+            self.s = limit;
+        }
+        self.s = self.sketch_size;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -263,6 +276,29 @@ pub(crate) fn open_compressed_file(path: &str) -> io::Result<Box<dyn BufRead + S
 }
 
 impl IndexBuilder {
+    fn clone_for_reorder(&self) -> Self {
+        let intermediate_data = self
+            .intermediate_data
+            .iter()
+            .map(|val| AtomicU32::new(val.load(Ordering::Relaxed)))
+            .collect();
+        Self {
+            ls: self.ls,
+            w: self.w,
+            k: self.k,
+            e: self.e,
+            s: self.s,
+            sketch_size: self.sketch_size,
+            fingerprint_range: self.fingerprint_range,
+            mi: self.mi,
+            intermediate_data,
+            num_docs: self.num_docs,
+            genome_numbers: AtomicU64::new(self.genome_numbers.load(Ordering::Relaxed)),
+            empty_sketches_count: AtomicU64::new(self.empty_sketches_count.load(Ordering::Relaxed)),
+            sketch_mode: self.sketch_mode,
+        }
+    }
+
     pub fn new(ils: u32, ik: u32, iw: u32, ie: u32, mode: SketchMode) -> Self {
         let s = 1u64 << ils;
         let fingerprint_range = 1u64 << iw;
@@ -314,7 +350,7 @@ impl IndexBuilder {
                 let mut uncompressed_buffer = Vec::new();
                 for mut gids in inverted_index {
                     let original_count = gids.len() as u32;
-                    let gids_bytes = if compress && !gids.is_empty() {
+                    let gids_bytes = if !gids.is_empty() {
                         gids.sort_unstable();
                         let mut prev = gids[0];
                         for i in 1..gids.len() {
@@ -322,18 +358,24 @@ impl IndexBuilder {
                             gids[i] = current.wrapping_sub(prev);
                             prev = current;
                         }
-                        let mut encoded_data = vec![0; 5 * gids.len()];
-                        let encoded_len = stream_vbyte::encode::encode::<
-                            stream_vbyte::scalar::Scalar,
-                        >(&gids, &mut encoded_data);
-                        encoded_data.truncate(encoded_len);
-                        encoded_data
-                    } else {
-                        let mut bytes = Vec::with_capacity(gids.len() * 4);
-                        for gid in gids {
-                            bytes.write_u32::<LittleEndian>(gid).unwrap();
+                        if compress {
+                            let mut encoded_data = vec![0; 5 * gids.len()];
+                            let encoded_len = stream_vbyte::encode::encode::<
+                                stream_vbyte::scalar::Scalar,
+                            >(
+                                &gids, &mut encoded_data
+                            );
+                            encoded_data.truncate(encoded_len);
+                            encoded_data
+                        } else {
+                            let mut bytes = Vec::with_capacity(gids.len() * 4);
+                            for delta in &gids {
+                                bytes.write_u32::<LittleEndian>(*delta).unwrap();
+                            }
+                            bytes
                         }
-                        bytes
+                    } else {
+                        Vec::new()
                     };
                     uncompressed_buffer
                         .write_u32::<LittleEndian>(original_count)
@@ -482,6 +524,160 @@ impl IndexBuilder {
                     }
                 }
             });
+    }
+
+    pub fn reorder_by_similarity(
+        &mut self,
+        min_similarity: f64,
+        sample_partitions: usize,
+        threads: usize,
+    ) -> io::Result<Vec<usize>> {
+        let num_docs = self.num_docs;
+        if num_docs <= 1 {
+            return Ok((0..num_docs).collect());
+        }
+        let total_positions = self.s as usize;
+        if total_positions == 0 {
+            return Ok((0..num_docs).collect());
+        }
+
+        let min_similarity = min_similarity.clamp(0.0, 1.0);
+        let temp_builder = self.clone_for_reorder();
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads.max(1))
+            .build()
+            .unwrap();
+
+        let order = pool.install(move || -> io::Result<Vec<usize>> {
+            let temp_dir = tempfile::tempdir()?;
+            let temp_index_path = temp_dir.path().join("reorder_index.bin");
+            let mut temp_index = temp_builder.into_final_index(
+                temp_index_path.to_str().expect("Invalid temp index path"),
+                false,
+                0,
+            )?;
+
+            if sample_partitions > 0 && sample_partitions < total_positions {
+                temp_index.set_partition_limit(sample_partitions as u64);
+            }
+
+            let temp_output_path = temp_dir.path().join("reorder_output.tsv");
+            temp_index.all_vs_self_comparison(
+                min_similarity,
+                false,
+                0,
+                temp_output_path.to_str().expect("Invalid temp output path"),
+                threads.max(1),
+                false,
+                1.0 / 1_000_000.0,
+            );
+            drop(temp_index);
+
+            let reader = BufReader::new(File::open(&temp_output_path)?);
+            let mut adjacency: Vec<Vec<(usize, f64)>> = vec![Vec::new(); num_docs];
+            for line_res in reader.lines() {
+                let line = line_res?;
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.split('\t');
+                let query_part = parts.next().unwrap_or_default();
+                let entries_part = parts.next().unwrap_or_default();
+                let query_gid = if let Some(idx_str) = query_part.strip_prefix("query_") {
+                    idx_str.parse::<usize>().unwrap_or(0)
+                } else {
+                    continue;
+                };
+                if entries_part.is_empty() {
+                    continue;
+                }
+                for entry in entries_part.split(',') {
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let mut kv = entry.split(':');
+                    let ref_gid = kv
+                        .next()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(usize::MAX);
+                    let sim = kv.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+                    if ref_gid == usize::MAX || ref_gid == query_gid || sim < min_similarity {
+                        continue;
+                    }
+                    adjacency[query_gid].push((ref_gid, sim));
+                    adjacency[ref_gid].push((query_gid, sim));
+                }
+            }
+
+            let mut total_weight: Vec<f64> = adjacency
+                .iter()
+                .map(|neighbors| neighbors.iter().map(|(_, sim)| *sim).sum())
+                .collect();
+            let mut visited = vec![false; num_docs];
+            let mut order = Vec::with_capacity(num_docs);
+
+            let mut current = total_weight
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+
+            for _ in 0..num_docs {
+                order.push(current);
+                visited[current] = true;
+                total_weight[current] = f64::MIN;
+
+                if order.len() == num_docs {
+                    break;
+                }
+
+                let mut best_choice: Option<(usize, f64)> = None;
+                for &(neighbor, sim) in &adjacency[current] {
+                    if visited[neighbor] {
+                        continue;
+                    }
+                    match best_choice {
+                        Some((best_idx, best_sim)) => {
+                            if sim > best_sim || (sim == best_sim && neighbor < best_idx) {
+                                best_choice = Some((neighbor, sim));
+                            }
+                        }
+                        None => best_choice = Some((neighbor, sim)),
+                    }
+                }
+
+                current = if let Some((neighbor, _)) = best_choice {
+                    neighbor
+                } else {
+                    total_weight
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| !visited[*idx])
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .map(|(idx, _)| idx)
+                        .unwrap_or_else(|| (0..num_docs).find(|idx| !visited[*idx]).unwrap_or(0))
+                };
+            }
+
+            Ok(order)
+        })?;
+
+        let raw_data = mem::take(&mut self.intermediate_data);
+        let dense: Vec<u32> = raw_data.into_iter().map(|atom| atom.into_inner()).collect();
+        let mut reordered = Vec::with_capacity(dense.len());
+        for pos in 0..total_positions {
+            let base = pos * num_docs;
+            for &doc_idx in &order {
+                reordered.push(dense[base + doc_idx]);
+            }
+        }
+        self.intermediate_data = reordered
+            .into_iter()
+            .map(|value| AtomicU32::new(value))
+            .collect();
+
+        Ok(order)
     }
 
     fn compute_sketch(&self, input: SketchInput, sketch: &mut Vec<u64>) {
@@ -671,6 +867,62 @@ impl Index {
         use_probabilistic_pruning: bool,
         prob_threshold_probability: f64,
     ) {
+        let _ = shard_zstd_level;
+        let _ = temp_dir_path;
+
+        Self::run_pairwise_comparison(
+            self,
+            query_index,
+            threshold,
+            is_matrix,
+            zstd_level,
+            output_file,
+            num_threads,
+            use_probabilistic_pruning,
+            prob_threshold_probability,
+            false,
+            "All-vs-all",
+        );
+    }
+
+    pub fn all_vs_self_comparison(
+        &self,
+        threshold: f64,
+        is_matrix: bool,
+        zstd_level: i32,
+        output_file: &str,
+        num_threads: usize,
+        use_probabilistic_pruning: bool,
+        prob_threshold_probability: f64,
+    ) {
+        Self::run_pairwise_comparison(
+            self,
+            self,
+            threshold,
+            is_matrix,
+            zstd_level,
+            output_file,
+            num_threads,
+            use_probabilistic_pruning,
+            prob_threshold_probability,
+            true,
+            "All-vs-self",
+        );
+    }
+
+    fn run_pairwise_comparison(
+        ref_index: &Self,
+        query_index: &Self,
+        threshold: f64,
+        is_matrix: bool,
+        zstd_level: i32,
+        output_file: &str,
+        num_threads: usize,
+        use_probabilistic_pruning: bool,
+        prob_threshold_probability: f64,
+        skip_identical_hits: bool,
+        label: &str,
+    ) {
         if let Ok((soft_limit, hard_limit)) = rlimit::getrlimit(rlimit::Resource::NOFILE) {
             if soft_limit < hard_limit {
                 if let Err(e) = rlimit::setrlimit(rlimit::Resource::NOFILE, hard_limit, hard_limit)
@@ -686,18 +938,17 @@ impl Index {
         let start_time = std::time::Instant::now();
 
         let num_queries = query_index.genome_numbers as usize;
-        let num_refs = self.genome_numbers as usize;
+        let num_refs = ref_index.genome_numbers as usize;
 
         let min_required_score = if threshold > 0.0 {
-            (threshold * self.s as f64).ceil() as u32
+            (threshold * ref_index.s as f64).ceil() as u32
         } else {
             0
         };
+        let probabilistic_active = use_probabilistic_pruning && min_required_score > 0;
+        let prob_cutoff = prob_threshold_probability.clamp(0.0, 1.0);
 
-        let _ = shard_zstd_level;
-        let _ = temp_dir_path;
-
-        let mut writer = self.create_writer(output_file, zstd_level);
+        let mut writer = ref_index.create_writer(output_file, zstd_level);
 
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
@@ -708,12 +959,8 @@ impl Index {
             .map(|_| Mutex::new(QueryAccumulator::new()))
             .collect();
 
-        let fingerprint_bits = self._w;
-        let prob_tail = prob_threshold_probability.clamp(1e-12, 0.5);
-        let z_cutoff = Self::tail_probability_to_z(prob_tail);
-
         pool.install(|| {
-            let total_positions = self.sketch_size as u64;
+            let total_positions = ref_index.sketch_size as u64;
             let num_pos = total_positions as usize;
             let chunks_per_thread = 4usize;
             let chunk_size = ((num_pos + (num_threads * chunks_per_thread) - 1)
@@ -723,14 +970,15 @@ impl Index {
             let pos_chunks: Vec<&[usize]> = pos_iterator.chunks(chunk_size).collect();
 
             let remaining_positions = AtomicUsize::new(num_pos);
-            let enable_prob_heuristic = use_probabilistic_pruning && min_required_score > 0;
-            let remaining_positions = &remaining_positions;
+            let enable_prob_heuristic = probabilistic_active;
             let shared_counts = &shared_counts;
+            let remaining_positions = &remaining_positions;
+
             pos_chunks.into_par_iter().for_each(|pos_chunk| {
                 let total_positions = total_positions;
                 let enable_prob_heuristic = enable_prob_heuristic;
                 let remaining_positions = remaining_positions;
-                let mut ref_file = File::open(&self.path_for_reading())
+                let mut ref_file = File::open(&ref_index.path_for_reading())
                     .expect("Cannot open reference index file in thread.");
                 let mut query_file = File::open(&query_index.path_for_reading())
                     .expect("Cannot open query index file in thread.");
@@ -746,9 +994,9 @@ impl Index {
                     let processed_positions = total_positions.saturating_sub(future_after_current);
                     let ref_pos_index = read_pos_from_file(
                         &mut ref_file,
-                        &self.toc_for_reading(),
+                        &ref_index.toc_for_reading(),
                         pos,
-                        self.fingerprint_range,
+                        ref_index.fingerprint_range,
                     );
                     let query_pos_index = read_pos_from_file(
                         &mut query_file,
@@ -757,7 +1005,7 @@ impl Index {
                         query_index.fingerprint_range,
                     );
 
-                    let fp_range = self.fingerprint_range as usize;
+                    let fp_range = ref_index.fingerprint_range as usize;
                     for fp in 0..fp_range {
                         let (ref_count, ref_bytes) = ref_pos_index.entry(fp);
                         if ref_count == 0 {
@@ -767,7 +1015,7 @@ impl Index {
                             &mut ref_gid_buf,
                             ref_count,
                             ref_bytes,
-                            self.is_compressed,
+                            ref_index.is_compressed,
                         );
                         if ref_gid_buf.is_empty() {
                             continue;
@@ -797,8 +1045,8 @@ impl Index {
                                             min_required_score,
                                             processed_positions,
                                             future_after_current,
-                                            fingerprint_bits,
-                                            z_cutoff,
+                                            threshold,
+                                            prob_cutoff,
                                         );
                                     }
                                 } else {
@@ -806,9 +1054,8 @@ impl Index {
                                         .entry(query_gid)
                                         .or_insert_with(AHashMap::new);
                                     for &ref_gid in &ref_gid_buf {
-                                        let entry = query_pending
-                                            .entry(ref_gid)
-                                            .or_insert(PendingRecord {
+                                        let entry =
+                                            query_pending.entry(ref_gid).or_insert(PendingRecord {
                                                 count: 0,
                                                 processed_positions,
                                                 future_after_current,
@@ -826,8 +1073,8 @@ impl Index {
                             &mut pending_updates,
                             enable_prob_heuristic,
                             min_required_score,
-                            fingerprint_bits,
-                            z_cutoff,
+                            threshold,
+                            prob_cutoff,
                         );
                     }
 
@@ -839,17 +1086,17 @@ impl Index {
                     &mut pending_updates,
                     enable_prob_heuristic,
                     min_required_score,
-                    fingerprint_bits,
-                    z_cutoff,
+                    threshold,
+                    prob_cutoff,
                 );
             })
         });
+
         let line_results: Vec<(String, usize)> = (0..num_queries)
             .into_par_iter()
             .map(|query_idx| {
                 let query_gid = query_idx as u32;
-                let mut line =
-                    String::with_capacity(if is_matrix { num_refs * 8 } else { 512 });
+                let mut line = String::with_capacity(if is_matrix { num_refs * 8 } else { 512 });
                 write!(&mut line, "query_{}\t", query_gid).unwrap();
                 let mut scores_count = 0usize;
 
@@ -861,7 +1108,7 @@ impl Index {
                             if count >= min_required_score {
                                 let ref_idx = ref_gid as usize;
                                 if ref_idx < num_refs {
-                                    full_row[ref_idx] = count as f64 / self.s as f64;
+                                    full_row[ref_idx] = count as f64 / ref_index.s as f64;
                                 }
                             }
                         });
@@ -886,20 +1133,21 @@ impl Index {
                         let query_acc = shared_counts[query_idx].lock();
                         query_acc.collect_filtered(min_required_score)
                     };
-                    filtered.sort_unstable_by(|a, b| {
-                        b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))
-                    });
-                    scores_count = filtered.len();
+                    filtered.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
                     let mut first = true;
                     for (ref_gid, count) in filtered {
+                        if skip_identical_hits && ref_gid == query_gid {
+                            continue;
+                        }
                         if first {
                             first = false;
                         } else {
                             line.push(',');
                         }
-                        let sim = count as f64 / self.s as f64;
+                        let sim = count as f64 / ref_index.s as f64;
                         write!(&mut line, "{}:{:.4}", ref_gid, sim).unwrap();
+                        scores_count += 1;
                     }
                 }
 
@@ -920,8 +1168,9 @@ impl Index {
         );
 
         println!(
-            "\nAll-vs-all comparison complete. Total time: {} seconds.",
-            start_time.elapsed().as_secs()
+            "\n{} comparison complete. Total time: {} seconds.",
+            label,
+            start_time.elapsed().as_secs(),
         );
     }
 
@@ -949,8 +1198,8 @@ impl Index {
         pending: &mut AHashMap<u32, AHashMap<u32, PendingRecord>>,
         enable_prob_heuristic: bool,
         min_required_score: u32,
-        fingerprint_bits: u32,
-        z_cutoff: f64,
+        similarity_threshold: f64,
+        prob_cutoff: f64,
     ) {
         if pending.is_empty() {
             return;
@@ -968,8 +1217,8 @@ impl Index {
                                     min_required_score,
                                     record.processed_positions,
                                     record.future_after_current,
-                                    fingerprint_bits,
-                                    z_cutoff,
+                                    similarity_threshold,
+                                    prob_cutoff,
                                 );
                             }
                         }
@@ -982,121 +1231,67 @@ impl Index {
     #[inline]
     fn probability_allows_threshold(
         enable: bool,
+        similarity_threshold: f64,
+        prob_cutoff: f64,
         min_required: u32,
         count: u32,
         processed: u64,
         remaining: u64,
-        _fingerprint_bits: u32,
-        z_cutoff: f64,
     ) -> bool {
-        if count >= min_required || !enable || min_required == 0 {
+        if !enable || min_required == 0 || prob_cutoff <= 0.0 {
             return true;
         }
-        if remaining <= 100 {
+        let prob_cutoff = prob_cutoff.min(1.0);
+        if count >= min_required {
             return true;
         }
+
         let delta = min_required.saturating_sub(count);
-        if delta == 0 {
-            return true;
-        }
         if delta as u64 > remaining {
             return false;
         }
 
-        const PRIOR_SUCC: f64 = 1.0;
-        const PRIOR_FAIL: f64 = 1.0;
-        if processed < 100 {
+        if !similarity_threshold.is_finite() {
             return true;
         }
-        let processed = processed.max(1);
+
+        if processed == 0 {
+            return true;
+        }
+
         if processed < count as u64 {
             return true;
         }
 
-        let failures = processed - count as u64;
-        let successes = count as f64 + PRIOR_SUCC;
-        let failures = failures as f64 + PRIOR_FAIL;
-        let p_hat = successes / (successes + failures);
-
-        let remaining_f = remaining as f64;
-        let mu = p_hat * remaining_f;
-        if mu <= 0.0 {
-            return false;
+        let processed_f = processed as f64;
+        if processed_f <= 0.0 {
+            return true;
         }
 
-        let variance = remaining_f * p_hat * (1.0 - p_hat);
-        if variance <= 1e-9 {
-            return mu >= delta as f64;
-        }
-        let sigma = variance.sqrt();
-        let target = (delta as f64 - 0.5).max(0.0);
-        let z = (target - mu) / sigma;
-        z <= z_cutoff
-    }
-
-    #[inline]
-    fn tail_probability_to_z(prob_tail: f64) -> f64 {
-        let clamped_tail = prob_tail.clamp(1e-12, 0.5 - 1e-12);
-        let upper_prob = (1.0 - clamped_tail).clamp(1e-12, 1.0 - 1e-12);
-        Self::standard_normal_quantile(upper_prob)
-    }
-
-    #[inline]
-    fn standard_normal_quantile(p: f64) -> f64 {
-        if p <= 0.0 {
-            return f64::NEG_INFINITY;
-        }
-        if p >= 1.0 {
-            return f64::INFINITY;
+        let observed_ratio = (count as f64) / processed_f;
+        if observed_ratio >= similarity_threshold {
+            return true;
         }
 
-        const A: [f64; 6] = [
-            -3.969_683_028_665_376e+01,
-            2.209_460_984_245_205e+02,
-            -2.759_285_104_469_687e+02,
-            1.383_577_518_672_69e+02,
-            -3.066_479_806_614_716e+01,
-            2.506_628_277_459_239e+00,
-        ];
-        const B: [f64; 5] = [
-            -5.447_609_879_822_406e+01,
-            1.615_858_368_580_409e+02,
-            -1.556_989_798_598_866e+02,
-            6.680_131_188_771_972e+01,
-            -1.328_068_155_288_572e+01,
-        ];
-        const C: [f64; 6] = [
-            -7.784_894_002_430_293e-03,
-            -3.223_964_580_411_365e-01,
-            -2.400_758_277_161_838e+00,
-            -2.549_732_539_343_734e+00,
-            4.374_664_141_464_968e+00,
-            2.938_163_982_698_783e+00,
-        ];
-        const D: [f64; 4] = [
-            7.784_695_709_041_462e-03,
-            3.224_671_290_700_398e-01,
-            2.445_134_137_142_996e+00,
-            3.754_408_661_907_416e+00,
-        ];
+        let threshold_prob = similarity_threshold.clamp(1e-12, 1.0 - 1e-12);
 
-        let q = p - 0.5;
-        if q.abs() <= 0.425 {
-            let r = 0.180625 - q * q;
-            let num = ((((A[0] * r + A[1]) * r + A[2]) * r + A[3]) * r + A[4]) * r + A[5];
-            let den = ((((B[0] * r + B[1]) * r + B[2]) * r + B[3]) * r + B[4]) * r + 1.0;
-            return q * num / den;
-        }
-
-        let (r, sign) = if q < 0.0 {
-            (p, -1.0)
-        } else {
-            (1.0 - p, 1.0)
+        let trials = match usize::try_from(processed) {
+            Ok(v) if v > 0 => v,
+            _ => return true,
         };
-        let r = (-2.0 * r.ln()).sqrt();
-        let num = ((((C[0] * r + C[1]) * r + C[2]) * r + C[3]) * r + C[4]) * r + C[5];
-        let den = (((D[0] * r + D[1]) * r + D[2]) * r + D[3]) * r + 1.0;
-        sign * num / den
+
+        let binomial = if threshold_prob <= 0.5 {
+            Binomial::new(trials, threshold_prob)
+        } else {
+            Binomial::with_failure(trials, 1.0 - threshold_prob)
+        };
+
+        let probability = binomial.mass(count as usize);
+        if !probability.is_finite() {
+            return true;
+        }
+
+        probability >= prob_cutoff
     }
 }
 
@@ -1179,8 +1374,16 @@ fn decode_gid_list_into(output: &mut Vec<Gid>, count: u32, bytes: &[u8], is_comp
     } else {
         output.reserve(count as usize);
         let mut cursor = io::Cursor::new(bytes);
-        for _ in 0..count {
-            output.push(cursor.read_u32::<LittleEndian>().unwrap());
+        let mut prev = 0u32;
+        for idx in 0..count {
+            let delta = cursor.read_u32::<LittleEndian>().unwrap();
+            if idx == 0 {
+                prev = delta;
+                output.push(delta);
+            } else {
+                prev = prev.wrapping_add(delta);
+                output.push(prev);
+            }
         }
     }
 }
