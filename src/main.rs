@@ -135,7 +135,7 @@ fn main() {
                 .arg(
                     Arg::new("reorder_similarity")
                         .long("reorder-similarity")
-                        .help("After building the sketch, greedily reorder sketches by self-similarity to improve locality.")
+                        .help("After building the sketch, greedily reorder sketches by self-similarity with probabilistic pruning to improve locality.")
                         .action(ArgAction::SetTrue),
                 )
                 .arg(
@@ -389,7 +389,7 @@ fn main() {
                 .copied()
                 .unwrap_or(100);
             println!(
-                "Reordering sketches by greedy self-similarity chain (min sim {:.3}, sample {})...",
+                "Reordering sketches by greedy self-similarity chain (min sim {:.3}, sample {}) with probabilistic pruning...",
                 reorder_threshold,
                 if reorder_sample == 0 {
                     "all".to_string()

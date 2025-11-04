@@ -564,14 +564,17 @@ impl IndexBuilder {
             }
 
             let temp_output_path = temp_dir.path().join("reorder_output.tsv");
+            // Reuse the efficient pairwise comparison but lean on probabilistic pruning to avoid
+            // exploring pairs that are very unlikely to meet the similarity threshold.
+            let reorder_prob_tail = 0.001;
             temp_index.all_vs_self_comparison(
                 min_similarity,
                 false,
                 0,
                 temp_output_path.to_str().expect("Invalid temp output path"),
                 threads.max(1),
-                false,
-                1.0 / 1_000_000.0,
+                true,
+                reorder_prob_tail,
             );
             drop(temp_index);
 
