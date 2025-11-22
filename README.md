@@ -27,10 +27,12 @@ target/release/Onika --help
    cat data/fof.txt
    ```
 2) Build a sketch index from the sample FOF:
-   ```./target/release/Onika sketch --input-fof data/fof.txt --k_size 31 --s_size 10 --w_size 16  --reorder-similarity -o index.bin
+   ```bash
+   ./target/release/Onika sketch --input-fof data/fof.txt --k_size 31 --s_size 10 --w_size 16  --reorder-similarity -o index.bin
    ```
 3) Compare  the built index against itself:
-   ``` ./target/release/Onika compare --ref-sketch index.bin --query-sketch  index.bin -o out.tsv.zst
+   ```bash
+    ./target/release/Onika compare --ref-sketch index.bin --query-sketch  index.bin -o out.tsv.zst
    ```
    By default the output is Zstandard-compressed. Use `--zstd-level 0` to write plain text.
 
