@@ -86,7 +86,7 @@ fn estimate_genome_size(matches: &ArgMatches) -> u32 {
 }
 
 fn main() {
-    let cli_matches = Command::new("Onika-rs")
+    let cli_matches = Command::new("Onika")
         .version("1.0")
         .author("Rust Translation")
         .about("A tool for MinHash sketching and all-versus-all comparison.")
@@ -186,7 +186,9 @@ fn main() {
                     Arg::new("sketch_mode")
                         .long("sketch-mode")
                         .value_name("MODE")
+                        .help("Sketch mode; \"perfect\" is experimental and subject to change.")
                         .default_value("default")
+                        .hide_possible_values(true)
                         .value_parser(["default", "perfect"]),
                 )
                 .arg(
@@ -307,7 +309,9 @@ fn main() {
                     Arg::new("sketch_mode")
                         .long("sketch-mode")
                         .value_name("MODE")
+                        .help("Sketch mode; \"perfect\" is experimental and subject to change.")
                         .default_value("default")
+                        .hide_possible_values(true)
                         .value_parser(["default", "perfect"]),
                 )
                 .arg(

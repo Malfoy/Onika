@@ -25,6 +25,10 @@ num_cpus = "1.17.0"
 parking_lot = "0.12"
 ahash = "0.8.12"
 
+[[bin]]
+name = "Onika"
+path = "src/main.rs"
+
 # Release profile for maximum optimization
 [profile.release]
 opt-level = 3      # Tell the compiler to optimize for speed (level 3 is the highest)
