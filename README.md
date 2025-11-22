@@ -32,29 +32,25 @@ target/release/Onika --help
 - Both modes accept gzipped or zstd-compressed input transparently.
 
 ## Quick start
-1) Prepare a FOF with your references:
-   ```text
-   data/ref1.fna.gz
-   data/ref2.fna
-   data/ref3.fq.zst
-   ```
-2) Build reference sketches:
+1) Inspect the bundled sample FOF (two genomes in `data/`):
    ```bash
-   target/release/Onika sketch \
-     --input-fof refs.fof \
-     --k-size 31 --s-size 10 --w-size 16 \
+   cat data/fof.txt
+   ```
+2) Build a sketch index from the sample FOF:
+   ```./target/release/Onika sketch \
+     --input-fof data/fof.txt \
+     --k_size 31 --s_size 10 --w_size 16 \
      --zstd-level 3 \
      --reorder-similarity \
-     -o ref.index.bin
+     -o sample.index.bin
    ```
-3) Compare queries against the reference index:
-   ```bash
-   target/release/Onika compare \
-     --ref-sketch ref.index.bin \
-     --query-fof queries.fof \
+3) Compare the same FOF against the built index (self-comparison demo):
+   ```./target/release/Onika compare \     
+     --ref-sketch sample.index.bin \
+     --query-sketch  sample.index.bin \
      --threshold 0.05 \
-     --prob-threshold-heuristic --prob-threshold-probability 0.001 \
-     -o ref_vs_queries.tsv.zst
+     --prob-threshold-probability 0.001 \
+     -o sample_ref_vs_queries.tsv.zst
    ```
    By default the output is Zstandard-compressed. Use `--zstd-level 0` to write plain text.
 
